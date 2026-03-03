@@ -10,6 +10,7 @@
 #include "usb_host.h"
 #include "usb_device.h"
 #include "desc_capture.h"
+#include "kmbox.h"
 
 extern uint32_t millis(void);
 extern void delay(uint32_t msec);
@@ -60,6 +61,7 @@ typedef struct {
 	uint8_t  host_slot;
 	uint8_t  dev_ep_num;
 	uint16_t maxpkt;
+	uint8_t  iface_protocol;  // 1=keyboard, 2=mouse (for kmbox merge)
 } ep_mapping_t;
 
 // Static to keep off the stack (~3.6KB struct)
@@ -68,6 +70,7 @@ static captured_descriptors_t desc;
 int main(void)
 {
 	uart_init();
+	kmbox_init();
 	uart_puts("\r\n\r\nimxrtnsy: USB proxy\r\n");
 	uart_puts("Teensy 4.1 — i.MX RT1062\r\n\r\n");
 	led_on();
@@ -188,9 +191,10 @@ int main(void)
 		usb_host_interrupt_init(slot, desc.dev_addr, ep,
 			desc.ifaces[i].interrupt_maxpkt);
 
-		ep_map[slot].host_slot  = slot;
-		ep_map[slot].dev_ep_num = ep;
-		ep_map[slot].maxpkt     = desc.ifaces[i].interrupt_maxpkt;
+		ep_map[slot].host_slot       = slot;
+		ep_map[slot].dev_ep_num      = ep;
+		ep_map[slot].maxpkt          = desc.ifaces[i].interrupt_maxpkt;
+		ep_map[slot].iface_protocol  = desc.ifaces[i].iface_protocol;
 		num_ep_mappings++;
 	}
 
@@ -243,11 +247,14 @@ int main(void)
 
 	while (1) {
 		usb_device_poll();
+		kmbox_poll();
 
 		for (uint8_t m = 0; m < num_ep_mappings; m++) {
 			ret = usb_host_interrupt_poll(ep_map[m].host_slot,
 				report_buf, ep_map[m].maxpkt);
 			if (ret > 0) {
+				kmbox_merge_report(ep_map[m].iface_protocol,
+					report_buf, ret);
 				bool sent = usb_device_send_report(
 					ep_map[m].dev_ep_num, report_buf, ret);
 				if (sent) {
@@ -300,6 +307,9 @@ int main(void)
 
 			last_stats = millis();
 		}
+
+		// Send injected-only reports if no real report was merged this cycle
+		kmbox_send_pending(&desc);
 
 		// Disconnect check (every ~1024 iterations, not every loop)
 		if ((++loop_count & 0x3FF) == 0) {

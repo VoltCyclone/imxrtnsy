@@ -23,7 +23,7 @@ LDFLAGS = $(MCU_FLAGS) \
           --specs=nano.specs --specs=nosys.specs
 
 CORE_SRC = core/startup.c core/bootdata.c
-SRC      = src/main.c src/uart.c src/usb_host.c src/usb_device.c src/desc_capture.c
+SRC      = src/main.c src/uart.c src/usb_host.c src/usb_device.c src/desc_capture.c src/kmbox.c
 
 OBJ = $(CORE_SRC:.c=.o) $(SRC:.c=.o)
 
