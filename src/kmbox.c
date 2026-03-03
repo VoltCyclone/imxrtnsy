@@ -1,25 +1,48 @@
-// KMBox B-style binary command injection over LPUART6
-// Receives commands from an external controller and merges injected
-// keyboard/mouse inputs additively with real device HID reports.
+// Multi-protocol command injection over LPUART6
+// Auto-detects and handles three protocols on the same UART:
+//   - KMBox B binary: sync 0x57 0xAB, cmd, len, payload, checksum
+//   - Makcu binary:   sync 0x50, cmd, len_lo, len_hi, payload
+//   - Ferrum text:    km.command(args)\n  (any printable ASCII start)
+//
+// Integrates smooth injection queue with FPU-based humanization tremor.
+// Merges injected keyboard/mouse inputs additively with real device HID reports.
 
 #include "kmbox.h"
+#include "smooth.h"
+#include "ferrum.h"
+#include "makcu.h"
 #include "imxrt.h"
 #include "usb_device.h"
 #include <string.h>
 
-// ---- UART constants (same as uart.c) ----
+// ---- UART constants ----
 #define UART_BAUD  115200
 #define UART_CLOCK 24000000
 
-// ---- Parser state machine ----
+// ---- Multi-protocol dispatcher state ----
 typedef enum {
-	KMBOX_STATE_SYNC1,
-	KMBOX_STATE_SYNC2,
-	KMBOX_STATE_CMD,
-	KMBOX_STATE_LEN,
-	KMBOX_STATE_PAYLOAD,
-	KMBOX_STATE_CHECKSUM
-} kmbox_parse_state_t;
+	PROTO_IDLE,       // waiting for first byte to determine protocol
+	PROTO_KMBOX,      // in KMBox B binary frame
+	PROTO_MAKCU,      // in Makcu binary frame
+	PROTO_FERRUM      // accumulating text line
+} proto_mode_t;
+
+// ---- KMBox B parser states ----
+typedef enum {
+	KB_SYNC2,
+	KB_CMD,
+	KB_LEN,
+	KB_PAYLOAD,
+	KB_CHECKSUM
+} kb_state_t;
+
+// ---- Makcu parser states ----
+typedef enum {
+	MK_CMD,
+	MK_LEN_LO,
+	MK_LEN_HI,
+	MK_PAYLOAD
+} mk_state_t;
 
 // ---- Injection state ----
 typedef struct {
@@ -35,13 +58,30 @@ typedef struct {
 } kmbox_inject_t;
 
 // ---- Static state ----
-static kmbox_parse_state_t parse_state;
-static uint8_t  frame_buf[KMBOX_MAX_PAYLOAD];
-static uint8_t  frame_cmd;
-static uint8_t  frame_len;
-static uint8_t  frame_pos;
-static uint8_t  frame_checksum;
 
+// Protocol dispatcher
+static proto_mode_t proto_mode;
+
+// KMBox B parser
+static kb_state_t   kb_parse_state;
+static uint8_t      frame_buf[KMBOX_MAX_PAYLOAD];
+static uint8_t      frame_cmd;
+static uint8_t      frame_len;
+static uint8_t      frame_pos;
+static uint8_t      frame_checksum;
+
+// Makcu parser
+static mk_state_t   mk_parse_state;
+static uint8_t      mk_cmd;
+static uint16_t     mk_len;
+static uint16_t     mk_pos;
+static uint8_t      mk_buf[MAKCU_MAX_PAYLOAD];
+
+// Ferrum line buffer
+static char         ferrum_line[FERRUM_MAX_LINE];
+static uint8_t      ferrum_pos;
+
+// Shared injection state
 static kmbox_inject_t inject;
 static uint32_t frames_ok;
 static uint32_t frames_err;
@@ -50,8 +90,13 @@ static uint32_t frames_err;
 static bool merged_this_cycle;
 
 // ---- Forward declarations ----
-static void dispatch_frame(void);
+static void dispatch_kmbox_frame(void);
+static void dispatch_makcu_frame(void);
+static void dispatch_ferrum_line(void);
 static void uart_tx_byte(uint8_t b);
+static void uart_tx_bytes(const uint8_t *data, uint8_t len);
+static void apply_mouse_result(int16_t dx, int16_t dy, uint8_t buttons,
+                               int8_t wheel, bool use_smooth);
 
 // ---- Public API ----
 
@@ -79,10 +124,17 @@ void kmbox_init(void)
 	LPUART6_BAUD = LPUART_BAUD_OSR(osr) | LPUART_BAUD_SBR(sbr);
 	LPUART6_CTRL = LPUART_CTRL_TE | LPUART_CTRL_RE;
 
-	parse_state = KMBOX_STATE_SYNC1;
+	proto_mode = PROTO_IDLE;
+	kb_parse_state = KB_SYNC2;
+	mk_parse_state = MK_CMD;
+	ferrum_pos = 0;
 	memset(&inject, 0, sizeof(inject));
 	frames_ok = 0;
 	frames_err = 0;
+
+	ferrum_init();
+	makcu_init();
+	smooth_init();
 }
 
 void kmbox_poll(void)
@@ -93,80 +145,157 @@ void kmbox_poll(void)
 	uint32_t stat = LPUART6_STAT;
 	if (stat & (LPUART_STAT_OR | LPUART_STAT_FE | LPUART_STAT_NF)) {
 		LPUART6_STAT = stat & (LPUART_STAT_OR | LPUART_STAT_FE | LPUART_STAT_NF);
-		parse_state = KMBOX_STATE_SYNC1;
+		proto_mode = PROTO_IDLE;
+		ferrum_pos = 0;
 	}
 
 	// Drain all available RX bytes (non-blocking)
 	while (LPUART6_STAT & LPUART_STAT_RDRF) {
 		uint8_t b = (uint8_t)(LPUART6_DATA & 0xFF);
 
-		switch (parse_state) {
-		case KMBOX_STATE_SYNC1:
+		switch (proto_mode) {
+		case PROTO_IDLE:
+			// Auto-detect protocol from first byte
 			if (b == KMBOX_SYNC1) {
+				// KMBox B: first sync byte 0x57
+				proto_mode = PROTO_KMBOX;
 				frame_checksum = b;
-				parse_state = KMBOX_STATE_SYNC2;
+				kb_parse_state = KB_SYNC2;
+			} else if (b == MAKCU_SYNC_BYTE) {
+				// Makcu: sync byte 0x50
+				proto_mode = PROTO_MAKCU;
+				mk_parse_state = MK_CMD;
+			} else if (b >= 0x20 && b < 0x7F) {
+				// Printable ASCII — start Ferrum text line
+				proto_mode = PROTO_FERRUM;
+				ferrum_pos = 0;
+				ferrum_line[ferrum_pos++] = (char)b;
 			}
+			// else: discard non-printable, non-sync bytes
 			break;
 
-		case KMBOX_STATE_SYNC2:
-			if (b == KMBOX_SYNC2) {
+		// ---- KMBox B binary protocol ----
+		case PROTO_KMBOX:
+			switch (kb_parse_state) {
+			case KB_SYNC2:
+				if (b == KMBOX_SYNC2) {
+					frame_checksum += b;
+					kb_parse_state = KB_CMD;
+				} else if (b == KMBOX_SYNC1) {
+					// Could be restart — keep sync1 checksum
+					frame_checksum = b;
+				} else {
+					proto_mode = PROTO_IDLE;
+				}
+				break;
+			case KB_CMD:
+				frame_cmd = b;
 				frame_checksum += b;
-				parse_state = KMBOX_STATE_CMD;
-			} else if (b == KMBOX_SYNC1) {
-				// Could be start of a new frame
-				frame_checksum = b;
-				// Stay in SYNC2
+				kb_parse_state = KB_LEN;
+				break;
+			case KB_LEN:
+				frame_len = b;
+				frame_checksum += b;
+				if (frame_len > KMBOX_MAX_PAYLOAD) {
+					frames_err++;
+					proto_mode = PROTO_IDLE;
+				} else if (frame_len == 0) {
+					kb_parse_state = KB_CHECKSUM;
+				} else {
+					frame_pos = 0;
+					kb_parse_state = KB_PAYLOAD;
+				}
+				break;
+			case KB_PAYLOAD:
+				frame_buf[frame_pos++] = b;
+				frame_checksum += b;
+				if (frame_pos >= frame_len) {
+					kb_parse_state = KB_CHECKSUM;
+				}
+				break;
+			case KB_CHECKSUM:
+				if ((frame_checksum & 0xFF) == b) {
+					dispatch_kmbox_frame();
+					frames_ok++;
+				} else {
+					frames_err++;
+				}
+				proto_mode = PROTO_IDLE;
+				break;
+			}
+			break;
+
+		// ---- Makcu binary protocol ----
+		case PROTO_MAKCU:
+			switch (mk_parse_state) {
+			case MK_CMD:
+				mk_cmd = b;
+				mk_parse_state = MK_LEN_LO;
+				break;
+			case MK_LEN_LO:
+				mk_len = b;
+				mk_parse_state = MK_LEN_HI;
+				break;
+			case MK_LEN_HI:
+				mk_len |= (uint16_t)b << 8;
+				if (mk_len > MAKCU_MAX_PAYLOAD) {
+					frames_err++;
+					proto_mode = PROTO_IDLE;
+				} else if (mk_len == 0) {
+					dispatch_makcu_frame();
+					frames_ok++;
+					proto_mode = PROTO_IDLE;
+				} else {
+					mk_pos = 0;
+					mk_parse_state = MK_PAYLOAD;
+				}
+				break;
+			case MK_PAYLOAD:
+				mk_buf[mk_pos++] = b;
+				if (mk_pos >= mk_len) {
+					dispatch_makcu_frame();
+					frames_ok++;
+					proto_mode = PROTO_IDLE;
+				}
+				break;
+			}
+			break;
+
+		// ---- Ferrum text protocol ----
+		case PROTO_FERRUM:
+			if (b == '\n' || b == '\r') {
+				// End of line — dispatch
+				if (ferrum_pos > 0) {
+					ferrum_line[ferrum_pos] = '\0';
+					dispatch_ferrum_line();
+				}
+				ferrum_pos = 0;
+				proto_mode = PROTO_IDLE;
+			} else if (ferrum_pos < FERRUM_MAX_LINE - 1) {
+				ferrum_line[ferrum_pos++] = (char)b;
 			} else {
-				parse_state = KMBOX_STATE_SYNC1;
+				// Line too long — discard
+				ferrum_pos = 0;
+				proto_mode = PROTO_IDLE;
 			}
-			break;
-
-		case KMBOX_STATE_CMD:
-			frame_cmd = b;
-			frame_checksum += b;
-			parse_state = KMBOX_STATE_LEN;
-			break;
-
-		case KMBOX_STATE_LEN:
-			frame_len = b;
-			frame_checksum += b;
-			if (frame_len > KMBOX_MAX_PAYLOAD) {
-				frames_err++;
-				parse_state = KMBOX_STATE_SYNC1;
-			} else if (frame_len == 0) {
-				parse_state = KMBOX_STATE_CHECKSUM;
-			} else {
-				frame_pos = 0;
-				parse_state = KMBOX_STATE_PAYLOAD;
-			}
-			break;
-
-		case KMBOX_STATE_PAYLOAD:
-			frame_buf[frame_pos++] = b;
-			frame_checksum += b;
-			if (frame_pos >= frame_len) {
-				parse_state = KMBOX_STATE_CHECKSUM;
-			}
-			break;
-
-		case KMBOX_STATE_CHECKSUM:
-			if ((frame_checksum & 0xFF) == b) {
-				dispatch_frame();
-				frames_ok++;
-			} else {
-				frames_err++;
-			}
-			parse_state = KMBOX_STATE_SYNC1;
 			break;
 		}
+	}
+
+	// Process smooth injection queue and add output to inject state
+	int16_t sx, sy;
+	smooth_process_frame(&sx, &sy);
+	if (sx != 0 || sy != 0) {
+		inject.mouse_dx += sx;
+		inject.mouse_dy += sy;
+		inject.mouse_dirty = true;
 	}
 }
 
 void kmbox_merge_report(uint8_t iface_protocol, uint8_t *report, uint8_t len)
 {
 	if (iface_protocol == 2 && inject.mouse_dirty) {
-		// Mouse merge
-		// Buttons: OR the masks (byte 0)
+		// Mouse merge — buttons OR, deltas add
 		report[0] |= inject.mouse_buttons;
 
 		if (len == 3) {
@@ -212,14 +341,9 @@ void kmbox_merge_report(uint8_t iface_protocol, uint8_t *report, uint8_t len)
 	} else if (iface_protocol == 1 && inject.kb_dirty) {
 		// Keyboard merge (8-byte boot report)
 		if (len >= 8) {
-			// OR modifier bytes
 			report[0] |= inject.kb_modifier;
-
-			// Merge keycodes into empty slots
 			for (int i = 0; i < 6; i++) {
 				if (inject.kb_keys[i] == 0) continue;
-
-				// Check if already present
 				bool found = false;
 				for (int j = 2; j < 8; j++) {
 					if (report[j] == inject.kb_keys[i]) {
@@ -243,7 +367,6 @@ void kmbox_merge_report(uint8_t iface_protocol, uint8_t *report, uint8_t len)
 
 void kmbox_send_pending(const captured_descriptors_t *desc)
 {
-	// If we already merged into a real report this cycle, nothing to do
 	if (merged_this_cycle) return;
 
 	// Send synthetic mouse report if dirty
@@ -255,14 +378,12 @@ void kmbox_send_pending(const captured_descriptors_t *desc)
 			uint8_t ep = desc->ifaces[i].interrupt_ep & 0x0F;
 			uint16_t maxpkt = desc->ifaces[i].interrupt_maxpkt;
 
-			// Build synthetic report (zeroed base + inject data)
 			uint8_t synth[8];
 			memset(synth, 0, sizeof(synth));
 			synth[0] = inject.mouse_buttons;
 
 			uint8_t rlen;
 			if (maxpkt <= 3) {
-				// Boot protocol format
 				int16_t dx = inject.mouse_dx;
 				int16_t dy = inject.mouse_dy;
 				if (dx > 127) dx = 127;
@@ -273,7 +394,6 @@ void kmbox_send_pending(const captured_descriptors_t *desc)
 				synth[2] = (uint8_t)(int8_t)dy;
 				rlen = 3;
 			} else {
-				// Extended format: int16 LE
 				synth[1] = inject.mouse_dx & 0xFF;
 				synth[2] = (inject.mouse_dx >> 8) & 0xFF;
 				synth[3] = inject.mouse_dy & 0xFF;
@@ -292,7 +412,7 @@ void kmbox_send_pending(const captured_descriptors_t *desc)
 		}
 	}
 
-	// Send synthetic keyboard report if dirty and no real keyboard report
+	// Send synthetic keyboard report if dirty
 	if (inject.kb_dirty) {
 		for (uint8_t i = 0; i < desc->num_ifaces; i++) {
 			if (desc->ifaces[i].iface_protocol != 1) continue;
@@ -312,7 +432,7 @@ void kmbox_send_pending(const captured_descriptors_t *desc)
 uint32_t kmbox_frame_count(void) { return frames_ok; }
 uint32_t kmbox_error_count(void) { return frames_err; }
 
-// ---- Internal ----
+// ---- Internal helpers ----
 
 static void uart_tx_byte(uint8_t b)
 {
@@ -323,7 +443,31 @@ static void uart_tx_byte(uint8_t b)
 	LPUART6_DATA = b;
 }
 
-static void dispatch_frame(void)
+static void uart_tx_bytes(const uint8_t *data, uint8_t len)
+{
+	for (uint8_t i = 0; i < len; i++)
+		uart_tx_byte(data[i]);
+}
+
+// Apply a mouse command result to the inject state.
+// If use_smooth is true, movement goes through smooth queue.
+static void apply_mouse_result(int16_t dx, int16_t dy, uint8_t buttons,
+                               int8_t wheel, bool use_smooth)
+{
+	inject.mouse_buttons = buttons;
+	inject.mouse_wheel += wheel;
+	inject.mouse_dirty = true;
+
+	if (use_smooth && (dx != 0 || dy != 0)) {
+		smooth_inject(dx, dy);
+	} else {
+		inject.mouse_dx += dx;
+		inject.mouse_dy += dy;
+	}
+}
+
+// ---- KMBox B frame dispatch ----
+static void dispatch_kmbox_frame(void)
 {
 	switch (frame_cmd) {
 	case KMBOX_CMD_MOUSE_MOVE:
@@ -361,7 +505,6 @@ static void dispatch_frame(void)
 	case KMBOX_CMD_KEYBOARD:
 		if (frame_len >= 8) {
 			inject.kb_modifier = frame_buf[0];
-			// frame_buf[1] is reserved
 			memcpy(inject.kb_keys, &frame_buf[2], 6);
 			inject.kb_dirty = true;
 		}
@@ -373,12 +516,60 @@ static void dispatch_frame(void)
 		inject.kb_dirty = false;
 		break;
 
+	case KMBOX_CMD_SMOOTH_MOVE:
+		if (frame_len >= 4) {
+			int16_t x = (int16_t)(frame_buf[0] | (frame_buf[1] << 8));
+			int16_t y = (int16_t)(frame_buf[2] | (frame_buf[3] << 8));
+			smooth_inject(x, y);
+		}
+		break;
+
+	case KMBOX_CMD_SMOOTH_CONFIG:
+		if (frame_len >= 1) {
+			smooth_set_max_per_frame((int16_t)frame_buf[0]);
+		}
+		break;
+
+	case KMBOX_CMD_SMOOTH_CLEAR:
+		smooth_clear();
+		break;
+
 	case KMBOX_CMD_PING:
 		uart_tx_byte(0xFE);
 		break;
 
 	default:
-		// Unknown command — silently ignore
 		break;
+	}
+}
+
+// ---- Makcu frame dispatch ----
+static void dispatch_makcu_frame(void)
+{
+	makcu_result_t result;
+	if (makcu_parse_command(mk_cmd, mk_buf, mk_len, &result)) {
+		if (result.has_mouse) {
+			apply_mouse_result(result.mouse_dx, result.mouse_dy,
+			                   result.mouse_buttons, result.mouse_wheel,
+			                   false);
+		}
+	}
+}
+
+// ---- Ferrum line dispatch ----
+static void dispatch_ferrum_line(void)
+{
+	ferrum_result_t result;
+	if (ferrum_parse_line(ferrum_line, ferrum_pos, &result)) {
+		if (result.has_mouse) {
+			apply_mouse_result(result.mouse_dx, result.mouse_dy,
+			                   result.mouse_buttons, result.mouse_wheel,
+			                   false);
+		}
+		if (result.needs_response) {
+			// Send >>> response
+			static const uint8_t resp[] = { '>', '>', '>', '\r', '\n' };
+			uart_tx_bytes(resp, 5);
+		}
 	}
 }

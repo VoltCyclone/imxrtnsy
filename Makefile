@@ -23,7 +23,8 @@ LDFLAGS = $(MCU_FLAGS) \
           --specs=nano.specs --specs=nosys.specs
 
 CORE_SRC = core/startup.c core/bootdata.c
-SRC      = src/main.c src/uart.c src/usb_host.c src/usb_device.c src/desc_capture.c src/kmbox.c
+SRC      = src/main.c src/uart.c src/usb_host.c src/usb_device.c src/desc_capture.c \
+           src/kmbox.c src/humanize.c src/smooth.c src/ferrum.c src/makcu.c
 
 OBJ = $(CORE_SRC:.c=.o) $(SRC:.c=.o)
 
@@ -31,7 +32,7 @@ all: $(TARGET).hex
 	@$(SIZE) $(TARGET).elf
 
 $(TARGET).elf: $(OBJ)
-	$(CC) $(LDFLAGS) -o $@ $^
+	$(CC) $(LDFLAGS) -o $@ $^ -lm
 
 $(TARGET).hex: $(TARGET).elf
 	$(OBJCOPY) -O ihex -R .eeprom $< $@

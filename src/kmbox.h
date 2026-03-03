@@ -10,6 +10,9 @@
 #define KMBOX_CMD_MOUSE_ALL      0x04
 #define KMBOX_CMD_KEYBOARD       0x05
 #define KMBOX_CMD_KEYBOARD_REL   0x06
+#define KMBOX_CMD_SMOOTH_MOVE    0x07  // smooth injection: int16 X, int16 Y
+#define KMBOX_CMD_SMOOTH_CONFIG  0x08  // config: uint8 max_per_frame
+#define KMBOX_CMD_SMOOTH_CLEAR   0x09  // flush smooth queue
 #define KMBOX_CMD_PING           0xFE
 
 // Frame constants
@@ -17,11 +20,16 @@
 #define KMBOX_SYNC2              0xAB
 #define KMBOX_MAX_PAYLOAD        56
 
-// Initialize LPUART6 for KMBox command reception.
+// Makcu sync byte (auto-detected alongside KMBox B)
+#define MAKCU_SYNC_BYTE          0x50
+
+// Initialize LPUART6 for multi-protocol command reception.
+// Auto-detects KMBox B (0x57), Makcu (0x50), and Ferrum (text) protocols.
 // Always active regardless of UART_ENABLED.
 void kmbox_init(void);
 
 // Poll UART RX, assemble frames, update injection state.
+// Also processes smooth injection queue each call.
 // Call once per main loop iteration. Non-blocking.
 void kmbox_poll(void);
 
