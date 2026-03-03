@@ -11,6 +11,7 @@
 #include "usb_device.h"
 #include "desc_capture.h"
 #include "kmbox.h"
+#include "smooth.h"
 
 extern uint32_t millis(void);
 extern void delay(uint32_t msec);
@@ -64,13 +65,34 @@ typedef struct {
 	uint8_t  iface_protocol;  // 1=keyboard, 2=mouse (for kmbox merge)
 } ep_mapping_t;
 
+// ---- PIT0: 1kHz tick for smooth injection timing ----
+static volatile bool pit_tick_pending;
+static void pit0_isr(void)
+{
+	PIT_TFLG0 = PIT_TFLG_TIF; // clear interrupt flag
+	pit_tick_pending = true;
+}
+
 // Static to keep off the stack (~3.6KB struct)
 static captured_descriptors_t desc;
 
 int main(void)
 {
+	// Enable SEVONPEND so WFE wakes on any pending interrupt
+	SCB_SCR |= SCB_SCR_SEVONPEND;
+
 	uart_init();
 	kmbox_init();
+
+	// PIT0: smooth injection timer — clock/ISR now, rate set after enumeration
+	CCM_CCGR1 |= CCM_CCGR1_PIT(CCM_CCGR_ON);
+	PIT_MCR = 0; // enable module, timers run in debug
+	PIT_TCTRL0 = 0; // stopped until we know the mouse poll interval
+	PIT_TFLG0 = PIT_TFLG_TIF;
+	attachInterruptVector(IRQ_PIT, pit0_isr);
+	NVIC_SET_PRIORITY(IRQ_PIT, 64);
+	NVIC_ENABLE_IRQ(IRQ_PIT);
+
 	uart_puts("\r\n\r\nimxrtnsy: USB proxy\r\n");
 	uart_puts("Teensy 4.1 — i.MX RT1062\r\n\r\n");
 	led_on();
@@ -86,7 +108,8 @@ int main(void)
 	uint32_t host_wait_loops = 0;
 	while (!usb_host_device_connected()) {
 		usb_host_power_on();
-		// State: waiting for mouse on USB2 host port
+		// State: waiting for device on USB2 host port — idle between blinks
+		__asm volatile("wfe");
 		led_wait_once(1, 70, 120, 650);
 		host_wait_loops++;
 
@@ -198,6 +221,37 @@ int main(void)
 		num_ep_mappings++;
 	}
 
+	// Start PIT0 at the mouse's poll rate (from bInterval + device speed)
+	{
+		uint32_t interval_us = 1000; // default 1ms = 1kHz
+		for (uint8_t i = 0; i < desc.num_ifaces; i++) {
+			if (desc.ifaces[i].iface_protocol != 2) continue;
+			uint8_t bint = desc.ifaces[i].interrupt_interval;
+			if (bint == 0) bint = 1;
+			if (speed == 2) {
+				// High-speed: 2^(bInterval-1) * 125 µs
+				interval_us = 125u << (bint > 1 ? bint - 1 : 0);
+			} else {
+				// Full/low speed: bInterval in ms
+				interval_us = (uint32_t)bint * 1000u;
+			}
+			break; // use first mouse interface
+		}
+		// Clamp to [125µs, 10ms] — sane range for smooth injection
+		if (interval_us < 125) interval_us = 125;
+		if (interval_us > 10000) interval_us = 10000;
+		uint32_t ldval = (150u * interval_us) - 1; // IPG = 150 MHz
+		PIT_LDVAL0 = ldval;
+		PIT_TCTRL0 = PIT_TCTRL_TIE | PIT_TCTRL_TEN;
+		uart_puts("  Smooth timer: ");
+		uart_putdec(interval_us);
+		uart_puts(" us (bInterval=");
+		uart_putdec(desc.ifaces[0].interrupt_interval);
+		uart_puts(", speed=");
+		uart_putdec(speed);
+		uart_puts(")\r\n");
+	}
+
 	// Initialize USB1 device stack
 	uart_puts("Initializing USB1 device stack...\r\n");
 	if (!usb_device_init(&desc)) {
@@ -248,6 +302,14 @@ int main(void)
 	while (1) {
 		usb_device_poll();
 		kmbox_poll();
+
+		// Process smooth queue at PIT-driven 1kHz rate
+		if (pit_tick_pending) {
+			pit_tick_pending = false;
+			int16_t sx, sy;
+			smooth_process_frame(&sx, &sy);
+			if (sx || sy) kmbox_inject_smooth(sx, sy);
+		}
 
 		for (uint8_t m = 0; m < num_ep_mappings; m++) {
 			ret = usb_host_interrupt_poll(ep_map[m].host_slot,

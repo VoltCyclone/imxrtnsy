@@ -41,6 +41,10 @@ void kmbox_merge_report(uint8_t iface_protocol, uint8_t *report, uint8_t len);
 // synthesize and send injected-only reports.
 void kmbox_send_pending(const captured_descriptors_t *desc);
 
+// Apply smooth injection output to inject state.
+// Called from PIT ISR-gated loop in main, not from kmbox_poll.
+void kmbox_inject_smooth(int16_t dx, int16_t dy);
+
 // Diagnostic counters
 uint32_t kmbox_frame_count(void);
 uint32_t kmbox_error_count(void);

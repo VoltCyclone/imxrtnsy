@@ -2,6 +2,10 @@
 // Replays captured descriptors and forwards HID reports.
 // Supports composite devices with multiple interrupt IN endpoints.
 // Bare-metal, polled (no interrupts).
+//
+// DMA buffers are in a non-cacheable MPU region (.dmabuffers at 0x20200000).
+// No manual cache maintenance needed — bare DSBs drain the write buffer
+// before the USB controller is told to read DMA structures.
 
 #include <string.h>
 #include "imxrt.h"
@@ -37,51 +41,6 @@ static bool int_ep_busy[USB_DEV_NUM_ENDPOINTS];  // indexed by EP number (1-7)
 static uint8_t ep_to_slot[USB_DEV_NUM_ENDPOINTS]; // EP num -> dtd/buf slot
 static uint8_t num_int_eps;
 
-// ---- Cache maintenance (same as usb_host.c) ----
-
-static void dev_cache_flush(const void *addr, uint32_t size)
-{
-	uint32_t location = (uint32_t)addr & ~31;
-	uint32_t end = ((uint32_t)addr + size + 31) & ~31;
-	asm volatile("dsb" ::: "memory");
-	while (location < end) {
-		SCB_CACHE_DCCIMVAC = location;
-		location += 32;
-	}
-	asm volatile("dsb" ::: "memory");
-	asm volatile("isb" ::: "memory");
-}
-
-static void dev_cache_invalidate(void *addr, uint32_t size)
-{
-	uint32_t location = (uint32_t)addr & ~31;
-	uint32_t end = ((uint32_t)addr + size + 31) & ~31;
-	asm volatile("dsb" ::: "memory");
-	while (location < end) {
-		SCB_CACHE_DCIMVAC = location;
-		location += 32;
-	}
-	asm volatile("dsb" ::: "memory");
-	asm volatile("isb" ::: "memory");
-}
-
-// Inline cache ops for fixed-size hot-path structures (no loop, no isb)
-static inline void dev_cache_flush_32(const void *addr)
-{
-	asm volatile("dsb" ::: "memory");
-	SCB_CACHE_DCCIMVAC = (uint32_t)addr;
-	asm volatile("dsb" ::: "memory");
-}
-
-static inline void dev_cache_flush_64(const void *addr)
-{
-	uint32_t a = (uint32_t)addr;
-	asm volatile("dsb" ::: "memory");
-	SCB_CACHE_DCCIMVAC = a;
-	SCB_CACHE_DCCIMVAC = a + 32;
-	asm volatile("dsb" ::: "memory");
-}
-
 // ---- Endpoint control register access ----
 
 static volatile uint32_t *endptctrl_reg(uint8_t ep)
@@ -98,7 +57,6 @@ static void ep0_tx_data(const uint8_t *data, uint16_t len)
 		if (len > sizeof(ep0_tx_buf)) len = sizeof(ep0_tx_buf);
 		memcpy(ep0_tx_buf, data, len);
 	}
-	dev_cache_flush(ep0_tx_buf, sizeof(ep0_tx_buf));
 
 	memset(&dtd_ep0_tx, 0, sizeof(dtd_ep0_tx));
 	dtd_ep0_tx.next = DTD_TERMINATE;
@@ -107,12 +65,11 @@ static void ep0_tx_data(const uint8_t *data, uint16_t len)
 		dtd_ep0_tx.buffer[0] = (uint32_t)ep0_tx_buf;
 		dtd_ep0_tx.buffer[1] = ((uint32_t)ep0_tx_buf + 4096) & ~0xFFF;
 	}
-	dev_cache_flush(&dtd_ep0_tx, sizeof(dtd_ep0_tx));
 
 	// Link dTD to EP0 TX dQH (index 1) and prime
 	dqh_list[1].next = (uint32_t)&dtd_ep0_tx;
 	dqh_list[1].token = 0;
-	dev_cache_flush(&dqh_list[1], sizeof(usb_dev_dqh_t));
+	asm volatile("dsb" ::: "memory");
 
 	USB1_ENDPTPRIME = (1 << 16); // Prime EP0 TX
 
@@ -125,11 +82,10 @@ static void ep0_tx_data(const uint8_t *data, uint16_t len)
 		memset(&dtd_ep0_rx, 0, sizeof(dtd_ep0_rx));
 		dtd_ep0_rx.next  = DTD_TERMINATE;
 		dtd_ep0_rx.token = DTD_ACTIVE | DTD_IOC | DTD_TOTAL_BYTES(0);
-		dev_cache_flush(&dtd_ep0_rx, sizeof(dtd_ep0_rx));
 
 		dqh_list[0].next  = (uint32_t)&dtd_ep0_rx;
 		dqh_list[0].token = 0;
-		dev_cache_flush(&dqh_list[0], sizeof(usb_dev_dqh_t));
+		asm volatile("dsb" ::: "memory");
 
 		USB1_ENDPTPRIME |= (1 << 0); // Prime EP0 RX
 	}
@@ -298,7 +254,7 @@ static void configure_all_interrupt_endpoints(void)
 		memset(&dqh_list[qh_idx], 0, sizeof(usb_dev_dqh_t));
 		dqh_list[qh_idx].config = DQH_MAX_PACKET(maxpkt) | DQH_ZLT_DISABLE;
 		dqh_list[qh_idx].next = DTD_TERMINATE;
-		dev_cache_flush(&dqh_list[qh_idx], sizeof(usb_dev_dqh_t));
+		asm volatile("dsb" ::: "memory");
 
 		volatile uint32_t *epctrl = endptctrl_reg(ep_num);
 		*epctrl = USB_ENDPTCTRL_TXE | USB_ENDPTCTRL_TXT(3) | USB_ENDPTCTRL_TXR;
@@ -445,7 +401,6 @@ static void handle_setup_packet(void)
 	// Read SETUP data using SUTW semaphore
 	do {
 		USB1_USBCMD |= USB_USBCMD_SUTW;
-		dev_cache_invalidate(&dqh_list[0], sizeof(usb_dev_dqh_t));
 		uint32_t s0 = dqh_list[0].setup0;
 		uint32_t s1 = dqh_list[0].setup1;
 		setup.bmRequestType = s0 & 0xFF;
@@ -510,7 +465,7 @@ static void handle_bus_reset(void)
 	dqh_list[0].token = 0;
 	dqh_list[1].next = DTD_TERMINATE;
 	dqh_list[1].token = 0;
-	dev_cache_flush(&dqh_list[0], 128);
+	asm volatile("dsb" ::: "memory");
 
 	memset(int_ep_busy, 0, sizeof(int_ep_busy));
 	num_int_eps = 0;
@@ -575,7 +530,7 @@ bool usb_device_init(const captured_descriptors_t *desc)
 	dqh_list[1].config = DQH_MAX_PACKET(64);
 	dqh_list[1].next = DTD_TERMINATE;
 
-	dev_cache_flush(dqh_list, sizeof(dqh_list));
+	asm volatile("dsb" ::: "memory");
 
 	// 5. Set endpoint list address
 	USB1_ENDPOINTLISTADDR = (uint32_t)dqh_list;
@@ -640,16 +595,14 @@ bool usb_device_send_report(uint8_t ep_num, const uint8_t *data, uint16_t len)
 
 	if (len > 64) len = 64;
 	memcpy(int_tx_buf[slot], data, len);
-	dev_cache_flush(int_tx_buf[slot], len);
 
 	dtd_int_tx[slot].next = DTD_TERMINATE;
 	dtd_int_tx[slot].token = DTD_ACTIVE | DTD_IOC | DTD_TOTAL_BYTES(len);
 	dtd_int_tx[slot].buffer[0] = (uint32_t)int_tx_buf[slot];
-	dev_cache_flush_32(&dtd_int_tx[slot]);
 
 	dqh_list[qh_idx].next = (uint32_t)&dtd_int_tx[slot];
 	dqh_list[qh_idx].token = 0;
-	dev_cache_flush_64(&dqh_list[qh_idx]);
+	asm volatile("dsb" ::: "memory");
 
 	USB1_ENDPTPRIME = (1 << (16 + ep_num));
 	int_ep_busy[ep_num] = true;

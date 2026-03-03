@@ -16,8 +16,16 @@
 #include <string.h>
 
 // ---- UART constants ----
+#ifndef UART_BAUD
 #define UART_BAUD  115200
+#endif
 #define UART_CLOCK 24000000
+
+// ---- eDMA RX ring buffer (non-cacheable via MPU region 10) ----
+#define DMA_RX_RING_SIZE 256
+static uint8_t dma_rx_ring[DMA_RX_RING_SIZE]
+	__attribute__((section(".dmabuffers"), aligned(DMA_RX_RING_SIZE)));
+static volatile uint16_t rx_tail;
 
 // ---- Multi-protocol dispatcher state ----
 typedef enum {
@@ -118,11 +126,38 @@ void kmbox_init(void)
 		IOMUXC_PAD_PKE | IOMUXC_PAD_PUE | IOMUXC_PAD_PUS(3);
 	IOMUXC_LPUART6_RX_SELECT_INPUT = 1;
 
-	// Baud: OSR=15, SBR = 24MHz / (115200 * 16) = 13
-	uint32_t osr = 15;
+	// Baud: dynamic OSR for high baud rates
+	uint32_t osr = (UART_BAUD > 460800) ? 25 : 15;
 	uint32_t sbr = UART_CLOCK / (UART_BAUD * (osr + 1));
+	if (sbr == 0) sbr = 1;
 	LPUART6_BAUD = LPUART_BAUD_OSR(osr) | LPUART_BAUD_SBR(sbr);
+
+	// Enable 4-entry RX and TX hardware FIFOs (must be set while TE/RE clear)
+	LPUART6_FIFO = LPUART_FIFO_RXFE | LPUART_FIFO_TXFE;
+	LPUART6_FIFO |= LPUART_FIFO_TXFLUSH | LPUART_FIFO_RXFLUSH;
+	LPUART6_WATER = LPUART_WATER_RXWATER(1);
+
 	LPUART6_CTRL = LPUART_CTRL_TE | LPUART_CTRL_RE;
+
+	// ---- eDMA channel 0: LPUART6 RX -> ring buffer ----
+	CCM_CCGR5 |= CCM_CCGR5_DMA(CCM_CCGR_ON);
+	DMAMUX_CHCFG0 = 0; // disable before reconfiguring
+	DMA_TCD0_SADDR = (volatile const void *)&LPUART6_DATA;
+	DMA_TCD0_SOFF = 0;
+	DMA_TCD0_ATTR = DMA_TCD_ATTR_SSIZE(DMA_TCD_ATTR_SIZE_8BIT) |
+	                DMA_TCD_ATTR_DSIZE(DMA_TCD_ATTR_SIZE_8BIT);
+	DMA_TCD0_NBYTES_MLNO = 1;
+	DMA_TCD0_SLAST = 0;
+	DMA_TCD0_DADDR = (volatile void *)dma_rx_ring;
+	DMA_TCD0_DOFF = 1;
+	DMA_TCD0_CITER_ELINKNO = DMA_RX_RING_SIZE;
+	DMA_TCD0_BITER_ELINKNO = DMA_RX_RING_SIZE;
+	DMA_TCD0_DLASTSGA = -DMA_RX_RING_SIZE;
+	DMA_TCD0_CSR = 0; // no DREQ — continuous circular operation
+	DMAMUX_CHCFG0 = DMAMUX_SOURCE_LPUART6_RX | DMAMUX_CHCFG_ENBL;
+	DMA_SERQ = 0; // enable channel 0 requests
+	LPUART6_BAUD |= LPUART_BAUD_RDMAE; // route RX to DMA
+	rx_tail = 0;
 
 	proto_mode = PROTO_IDLE;
 	kb_parse_state = KB_SYNC2;
@@ -149,9 +184,11 @@ void kmbox_poll(void)
 		ferrum_pos = 0;
 	}
 
-	// Drain all available RX bytes (non-blocking)
-	while (LPUART6_STAT & LPUART_STAT_RDRF) {
-		uint8_t b = (uint8_t)(LPUART6_DATA & 0xFF);
+	// Drain all DMA-received bytes from ring buffer
+	uint16_t head = ((uint32_t)DMA_TCD0_DADDR - (uint32_t)dma_rx_ring) & (DMA_RX_RING_SIZE - 1);
+	while (rx_tail != head) {
+		uint8_t b = dma_rx_ring[rx_tail];
+		rx_tail = (rx_tail + 1) & (DMA_RX_RING_SIZE - 1);
 
 		switch (proto_mode) {
 		case PROTO_IDLE:
@@ -282,14 +319,6 @@ void kmbox_poll(void)
 		}
 	}
 
-	// Process smooth injection queue and add output to inject state
-	int16_t sx, sy;
-	smooth_process_frame(&sx, &sy);
-	if (sx != 0 || sy != 0) {
-		inject.mouse_dx += sx;
-		inject.mouse_dy += sy;
-		inject.mouse_dirty = true;
-	}
 }
 
 void kmbox_merge_report(uint8_t iface_protocol, uint8_t *report, uint8_t len)
@@ -427,6 +456,13 @@ void kmbox_send_pending(const captured_descriptors_t *desc)
 			break;
 		}
 	}
+}
+
+void kmbox_inject_smooth(int16_t dx, int16_t dy)
+{
+	inject.mouse_dx += dx;
+	inject.mouse_dy += dy;
+	inject.mouse_dirty = true;
 }
 
 uint32_t kmbox_frame_count(void) { return frames_ok; }

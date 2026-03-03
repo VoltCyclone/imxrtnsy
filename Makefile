@@ -9,8 +9,11 @@ MCU_FLAGS = -mcpu=cortex-m7 -mfpu=fpv5-d16 -mfloat-abi=hard -mthumb
 
 # Pass UART=1 on command line to enable debug UART output (e.g. make UART=1)
 UART ?= 0
+# Override UART baud rate (e.g. make UART_BAUD=921600)
+UART_BAUD ?= 115200
 
-DEFINES = -DARDUINO_TEENSY41 -D__IMXRT1062__ -DF_CPU=600000000 -DUART_ENABLED=$(UART)
+DEFINES = -DARDUINO_TEENSY41 -D__IMXRT1062__ -DF_CPU=600000000 -DUART_ENABLED=$(UART) \
+          -DUART_BAUD=$(UART_BAUD)
 
 CFLAGS = $(MCU_FLAGS) $(DEFINES) \
          -Os -Wall -Wno-unused-variable \
@@ -36,6 +39,10 @@ $(TARGET).elf: $(OBJ)
 
 $(TARGET).hex: $(TARGET).elf
 	$(OBJCOPY) -O ihex -R .eeprom $< $@
+
+# Hot-path sources get -O2 instead of -Os for better inlining/unrolling
+HOT_SRC = src/usb_host.o src/usb_device.o src/kmbox.o src/smooth.o src/humanize.o
+$(HOT_SRC): CFLAGS := $(subst -Os,-O2,$(CFLAGS))
 
 %.o: %.c
 	$(CC) $(CFLAGS) -c -o $@ $<

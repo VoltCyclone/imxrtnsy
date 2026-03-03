@@ -1,5 +1,9 @@
 // EHCI USB Host controller driver for Teensy 4.1 USB2 port
 // Bare-metal, polled (no interrupts), blocking control transfers only.
+//
+// DMA buffers are in a non-cacheable MPU region (.dmabuffers at 0x20200000).
+// No manual cache maintenance needed — bare DSBs drain the write buffer
+// before the USB controller is told to read DMA structures.
 
 #include <string.h>
 #include "imxrt.h"
@@ -53,68 +57,6 @@ static void host_power_init(void)
 static void host_led_mark(uint8_t code)
 {
 	(void)code;
-}
-
-// Cortex-M7 data cache maintenance via SCB registers
-static void cache_flush(const void *addr, uint32_t size)
-{
-	uint32_t location = (uint32_t)addr & ~31;
-	uint32_t end = ((uint32_t)addr + size + 31) & ~31;
-	asm volatile("dsb" ::: "memory");
-	while (location < end) {
-		SCB_CACHE_DCCIMVAC = location;
-		location += 32;
-	}
-	asm volatile("dsb" ::: "memory");
-	asm volatile("isb" ::: "memory");
-}
-
-static void cache_invalidate(void *addr, uint32_t size)
-{
-	uint32_t location = (uint32_t)addr & ~31;
-	uint32_t end = ((uint32_t)addr + size + 31) & ~31;
-	asm volatile("dsb" ::: "memory");
-	while (location < end) {
-		SCB_CACHE_DCIMVAC = location;
-		location += 32;
-	}
-	asm volatile("dsb" ::: "memory");
-	asm volatile("isb" ::: "memory");
-}
-
-// Inline cache ops for fixed-size hot-path structures (no loop, no isb)
-// 32 bytes = 1 cache line (qTD/dTD)
-static inline void cache_flush_32(const void *addr)
-{
-	asm volatile("dsb" ::: "memory");
-	SCB_CACHE_DCCIMVAC = (uint32_t)addr;
-	asm volatile("dsb" ::: "memory");
-}
-
-static inline void cache_invalidate_32(void *addr)
-{
-	asm volatile("dsb" ::: "memory");
-	SCB_CACHE_DCIMVAC = (uint32_t)addr;
-	asm volatile("dsb" ::: "memory");
-}
-
-// 64 bytes = 2 cache lines (QH/dQH)
-static inline void cache_flush_64(const void *addr)
-{
-	uint32_t a = (uint32_t)addr;
-	asm volatile("dsb" ::: "memory");
-	SCB_CACHE_DCCIMVAC = a;
-	SCB_CACHE_DCCIMVAC = a + 32;
-	asm volatile("dsb" ::: "memory");
-}
-
-static inline void cache_invalidate_64(void *addr)
-{
-	uint32_t a = (uint32_t)addr;
-	asm volatile("dsb" ::: "memory");
-	SCB_CACHE_DCIMVAC = a;
-	SCB_CACHE_DCIMVAC = a + 32;
-	asm volatile("dsb" ::: "memory");
 }
 
 bool usb_host_init(void)
@@ -187,7 +129,7 @@ bool usb_host_init(void)
 	for (int i = 0; i < 32; i++) {
 		periodic_list[i] = 1; // T-bit = 1, terminate
 	}
-	cache_flush(periodic_list, sizeof(periodic_list));
+	asm volatile("dsb" ::: "memory");
 
 	// 8) Set up async QH as the idle head
 	memset(&qh_async, 0, sizeof(qh_async));
@@ -196,7 +138,7 @@ bool usb_host_init(void)
 	qh_async.next = QTD_TERMINATE;
 	qh_async.alt_next = QTD_TERMINATE;
 	qh_async.token = 0;
-	cache_flush(&qh_async, sizeof(qh_async));
+	asm volatile("dsb" ::: "memory");
 
 	// 9) Program EHCI registers
 	USB2_SBUSCFG = 1; // burst-aligned bus access (per PJRC)
@@ -313,7 +255,7 @@ static void setup_qh_for_control(uint8_t addr, uint8_t maxpkt, uint8_t speed)
 	qh_async.alt_next = QTD_TERMINATE;
 	qh_async.token = 0;
 
-	cache_flush(&qh_async, sizeof(qh_async));
+	asm volatile("dsb" ::: "memory");
 }
 
 // Execute the qTD chain currently linked to the async QH.
@@ -337,9 +279,6 @@ static int execute_transfer(uint32_t timeout_ms)
 	// QH overlay for HALTED which is set if any earlier qTD hits an error.
 	uint32_t start = millis();
 	while (1) {
-		cache_invalidate(&qh_async, sizeof(qh_async));
-		cache_invalidate(&qtd_status, sizeof(qtd_status));
-
 		// Check QH overlay for halt (error in any qTD in the chain)
 		uint32_t qh_token = qh_async.token;
 		if (qh_token & QTD_TOKEN_HALTED) {
@@ -377,7 +316,6 @@ int usb_host_control_transfer(uint8_t addr, uint8_t maxpkt,
 
 	// Copy setup packet to DMA buffer
 	memcpy(&setup_buf, setup, 8);
-	cache_flush(&setup_buf, sizeof(setup_buf));
 
 	// Set up QH for this device
 	setup_qh_for_control(addr, maxpkt, device_speed);
@@ -409,7 +347,6 @@ int usb_host_control_transfer(uint8_t addr, uint8_t maxpkt,
 		} else {
 			memcpy(xfer_buf, data, wLength);
 		}
-		cache_flush(xfer_buf, wLength);
 		{
 			uint32_t addr = (uint32_t)xfer_buf;
 			qtd_data.buffer[0] = addr;
@@ -444,15 +381,13 @@ int usb_host_control_transfer(uint8_t addr, uint8_t maxpkt,
 		qtd_setup.next = (uint32_t)&qtd_status;
 	}
 
-	cache_flush(&qtd_setup, sizeof(qtd_setup));
-	cache_flush(&qtd_data, sizeof(qtd_data));
-	cache_flush(&qtd_status, sizeof(qtd_status));
+	// Drain write buffer before linking to QH
+	asm volatile("dsb" ::: "memory");
 
 	// Link qTD chain to QH
-	cache_invalidate(&qh_async, sizeof(qh_async));
 	qh_async.next = (uint32_t)&qtd_setup;
 	qh_async.token = 0; // Clear any previous status
-	cache_flush(&qh_async, sizeof(qh_async));
+	asm volatile("dsb" ::: "memory");
 
 	// Execute and wait
 	int result = execute_transfer(2000);
@@ -460,9 +395,6 @@ int usb_host_control_transfer(uint8_t addr, uint8_t maxpkt,
 
 	// If IN transfer, copy received data back and return actual bytes
 	if (is_in && wLength > 0) {
-		cache_invalidate(xfer_buf, wLength);
-		cache_invalidate(&qtd_data, sizeof(qtd_data));
-
 		// Calculate bytes actually transferred
 		uint32_t remaining = (qtd_data.token >> 16) & 0x7FFF;
 		uint32_t transferred = wLength - remaining;
@@ -499,7 +431,6 @@ static void link_periodic_schedule(void)
 			}
 		}
 		qh_intr[i].horizontal_link = next_link;
-		cache_flush(&qh_intr[i], sizeof(qh_intr[i]));
 	}
 
 	// Find the first initialized QH
@@ -515,7 +446,7 @@ static void link_periodic_schedule(void)
 	for (int i = 0; i < 32; i++) {
 		periodic_list[i] = head;
 	}
-	cache_flush(periodic_list, sizeof(periodic_list));
+	asm volatile("dsb" ::: "memory");
 }
 
 static uint32_t intr_halt_count[MAX_INTR_EPS];
@@ -598,7 +529,6 @@ void usb_host_interrupt_dump_state(void)
 
 	for (uint8_t i = 0; i < num_intr_eps; i++) {
 		if (!intr_initialized[i]) continue;
-		cache_invalidate(&qh_intr[i], sizeof(qh_intr[i]));
 		uart_puts("  QH[");
 		uart_putdec(i);
 		uart_puts("] cap0=0x");
@@ -631,9 +561,6 @@ int usb_host_interrupt_poll(uint8_t index, uint8_t *data, uint16_t len)
 		// poll reads overlay Active=0 and incorrectly treats it as a
 		// completed transfer.  Writing Active=1 directly into the
 		// overlay makes the transfer immediately visible to the EHCI.
-		cache_flush(buf, len);
-
-		cache_invalidate(qh, sizeof(*qh));
 		uint32_t toggle = qh->token & QTD_TOKEN_TOGGLE;
 
 		qh->next     = QTD_TERMINATE;
@@ -649,7 +576,7 @@ int usb_host_interrupt_poll(uint8_t index, uint8_t *data, uint16_t len)
 			qh->buffer[3] = a + 0x3000;
 			qh->buffer[4] = a + 0x4000;
 		}
-		cache_flush(qh, sizeof(*qh));
+		asm volatile("dsb" ::: "memory");
 
 		intr_transfer_active[index] = true;
 		intr_prime_time[index] = millis();
@@ -657,14 +584,13 @@ int usb_host_interrupt_poll(uint8_t index, uint8_t *data, uint16_t len)
 	}
 
 	// Check completion (non-blocking, single check)
-	cache_invalidate(qh, sizeof(*qh));
 	uint32_t token = qh->token;
 
 	if (token & QTD_TOKEN_ACTIVE) {
 		if ((millis() - intr_prime_time[index]) > 100) {
 			qh->token = token & QTD_TOKEN_TOGGLE;
 			qh->next = QTD_TERMINATE;
-			cache_flush(qh, sizeof(*qh));
+			asm volatile("dsb" ::: "memory");
 			intr_transfer_active[index] = false;
 			intr_timeout_count[index]++;
 			if (intr_timeout_count[index] <= 5) {
@@ -695,7 +621,7 @@ int usb_host_interrupt_poll(uint8_t index, uint8_t *data, uint16_t len)
 		// Clear halt, preserve toggle, allow re-prime
 		qh->token = token & QTD_TOKEN_TOGGLE;
 		qh->next = QTD_TERMINATE;
-		cache_flush(qh, sizeof(*qh));
+		asm volatile("dsb" ::: "memory");
 		return 0;
 	}
 
@@ -710,12 +636,11 @@ int usb_host_interrupt_poll(uint8_t index, uint8_t *data, uint16_t len)
 		}
 		qh->token = token & QTD_TOKEN_TOGGLE;
 		qh->next = QTD_TERMINATE;
-		cache_flush(qh, sizeof(*qh));
+		asm volatile("dsb" ::: "memory");
 		return -1;
 	}
 
 	// Success
-	cache_invalidate(buf, len);
 	uint32_t remaining = (token >> 16) & 0x7FFF;
 	uint32_t transferred = len - remaining;
 	if (transferred > 0) {

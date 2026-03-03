@@ -156,6 +156,7 @@ FLASHMEM uint32_t set_arm_clock(uint32_t frequency)
 #define MEM_NOCACHE     SCB_MPU_RASR_TEX(1)
 #define DEV_NOCACHE     SCB_MPU_RASR_TEX(2)
 #define SIZE_32B    (SCB_MPU_RASR_SIZE(4) | SCB_MPU_RASR_ENABLE)
+#define SIZE_32K    (SCB_MPU_RASR_SIZE(14) | SCB_MPU_RASR_ENABLE)
 #define SIZE_128K   (SCB_MPU_RASR_SIZE(16) | SCB_MPU_RASR_ENABLE)
 #define SIZE_512K   (SCB_MPU_RASR_SIZE(18) | SCB_MPU_RASR_ENABLE)
 #define SIZE_1M     (SCB_MPU_RASR_SIZE(19) | SCB_MPU_RASR_ENABLE)
@@ -203,6 +204,11 @@ FLASHMEM static void configure_cache(void)
 
 	SCB_MPU_RBAR = 0x80000000 | REGION(i++); // SEMC
 	SCB_MPU_RASR = MEM_CACHE_WBWA | READWRITE | NOEXEC | SIZE_1G;
+
+	// DMA buffer overlay: non-cacheable (higher region # wins over region 5)
+	// Eliminates all manual cache maintenance for USB DMA structures
+	SCB_MPU_RBAR = 0x20200000 | REGION(10);
+	SCB_MPU_RASR = MEM_NOCACHE | READWRITE | NOEXEC | SIZE_32K;
 
 	asm("nop"); asm("nop"); asm("nop"); asm("nop"); asm("nop");
 	SCB_MPU_CTRL = SCB_MPU_CTRL_ENABLE;
