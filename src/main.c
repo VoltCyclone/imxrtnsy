@@ -12,11 +12,27 @@
 #include "desc_capture.h"
 #include "kmbox.h"
 #include "smooth.h"
+#if TFT_ENABLED
+#include "tft_display.h"
+#endif
 
 extern uint32_t millis(void);
 extern void delay(uint32_t msec);
 
 // LED on pin 13 (GPIO7 bit 3, configured in startup)
+// When TFT is enabled, pin 13 is LPSPI4_SCK — LED functions become no-ops.
+#if TFT_ENABLED
+static void led_on(void)  { }
+static void led_off(void) { }
+static void led_toggle(void) __attribute__((unused));
+static void led_toggle(void) { }
+static void led_blink_forever(uint8_t code, uint32_t on_ms, uint32_t off_ms)
+{
+	(void)code; (void)on_ms; (void)off_ms;
+	tft_display_error("FATAL");
+	while (1) delay(1000);
+}
+#else
 static void led_on(void)  { GPIO7_DR_SET = (1 << 3); }
 static void led_off(void) { GPIO7_DR_CLEAR = (1 << 3); }
 static void led_toggle(void) __attribute__((unused));
@@ -33,6 +49,7 @@ static void led_blink_forever(uint8_t code, uint32_t on_ms, uint32_t off_ms)
 		delay(600);
 	}
 }
+#endif
 
 static void led_stage(uint8_t n) __attribute__((unused));
 static void led_stage(uint8_t n)
@@ -99,10 +116,7 @@ int main(void)
 
 	// ---- Phase 1: Host init + descriptor capture ----
 
-	uart_puts("Initializing USB2 host controller...\r\n");
 	usb_host_init();
-
-	uart_puts("Waiting for device on USB host port...\r\n");
 	led_off();
 	usb_host_power_on();
 	uint32_t host_wait_loops = 0;
@@ -113,13 +127,6 @@ int main(void)
 		led_wait_once(1, 70, 120, 650);
 		host_wait_loops++;
 
-		// Periodic diagnostic: print PORTSC to help debug connect detection
-		if ((host_wait_loops % 5) == 1) {
-			uart_puts("  wait PORTSC=0x");
-			uart_puthex32(USB2_PORTSC1);
-			uart_puts("\r\n");
-		}
-
 		// Timeout after ~45s of connect attempts.
 		if (host_wait_loops > 60u) {
 			// No host-side USB device detected within timeout window
@@ -128,18 +135,10 @@ int main(void)
 	}
 
 	led_on();
-	uart_puts("Device connected!\r\n");
 	delay(10);
-
-	uart_puts("Resetting port...\r\n");
 	usb_host_port_reset();
 
 	uint8_t speed = usb_host_device_speed();
-	uart_puts("Device speed: ");
-	if (speed == 0) uart_puts("Full (12 Mbps)");
-	else if (speed == 1) uart_puts("Low (1.5 Mbps)");
-	else if (speed == 2) uart_puts("High (480 Mbps)");
-	uart_puts("\r\n\r\n");
 
 	if (!capture_descriptors(&desc)) {
 		uart_puts("\r\n=== CAPTURE FAILED ===\r\n");
@@ -147,12 +146,10 @@ int main(void)
 	}
 
 	uart_puts("\r\n=== CAPTURE COMPLETE ===\r\n");
-	dump_descriptors(&desc);
 
 	// ---- Phase 2: Device stack + proxy ----
 
 	// Set configuration on the real device so it starts generating reports
-	uart_puts("\r\nSetting configuration on device...\r\n");
 	usb_setup_t setup;
 	setup.bmRequestType = 0x00;
 	setup.bRequest = USB_REQ_SET_CONFIG;
@@ -163,14 +160,10 @@ int main(void)
 		&setup, NULL);
 	if (ret < 0) {
 		uart_puts("  SET_CONFIGURATION failed!\r\n");
-	} else {
-		uart_puts("  Device configured\r\n");
 	}
 	delay(10);
 
 	// Initialize host-side interrupt polling for all endpoints
-	uart_puts("Initializing interrupt polling...\r\n");
-
 	// Send SET_IDLE(0) and SET_PROTOCOL(1=report) to each HID interface.
 	// Some devices (including Razer) won't send interrupt reports until these
 	// class-specific requests have been issued.
@@ -181,11 +174,8 @@ int main(void)
 		setup.wValue = 0;      // duration=0 (indefinite), report ID=0 (all)
 		setup.wIndex = i;      // interface number
 		setup.wLength = 0;
-		ret = usb_host_control_transfer(desc.dev_addr, desc.ep0_maxpkt,
+		usb_host_control_transfer(desc.dev_addr, desc.ep0_maxpkt,
 			&setup, NULL);
-		uart_puts("  SET_IDLE iface ");
-		uart_putdec(i);
-		uart_puts(ret < 0 ? " STALL (ok)\r\n" : " ok\r\n");
 
 		// SET_PROTOCOL: bmRequestType=0x21, bRequest=0x0B
 		setup.bmRequestType = 0x21;
@@ -193,11 +183,8 @@ int main(void)
 		setup.wValue = 1;      // 1 = Report Protocol (not Boot Protocol)
 		setup.wIndex = i;
 		setup.wLength = 0;
-		ret = usb_host_control_transfer(desc.dev_addr, desc.ep0_maxpkt,
+		usb_host_control_transfer(desc.dev_addr, desc.ep0_maxpkt,
 			&setup, NULL);
-		uart_puts("  SET_PROTOCOL iface ");
-		uart_putdec(i);
-		uart_puts(ret < 0 ? " STALL (ok)\r\n" : " ok\r\n");
 	}
 	ep_mapping_t ep_map[MAX_INTR_EPS];
 	uint8_t num_ep_mappings = 0;
@@ -243,17 +230,9 @@ int main(void)
 		uint32_t ldval = (150u * interval_us) - 1; // IPG = 150 MHz
 		PIT_LDVAL0 = ldval;
 		PIT_TCTRL0 = PIT_TCTRL_TIE | PIT_TCTRL_TEN;
-		uart_puts("  Smooth timer: ");
-		uart_putdec(interval_us);
-		uart_puts(" us (bInterval=");
-		uart_putdec(desc.ifaces[0].interrupt_interval);
-		uart_puts(", speed=");
-		uart_putdec(speed);
-		uart_puts(")\r\n");
 	}
 
 	// Initialize USB1 device stack
-	uart_puts("Initializing USB1 device stack...\r\n");
 	if (!usb_device_init(&desc)) {
 		led_blink_forever(9, 80, 120);
 	}
@@ -261,7 +240,6 @@ int main(void)
 	// Wait for host PC to enumerate us — must call usb_device_poll()
 	// continuously so SETUP packets are answered within the USB spec
 	// timeout.  Blocking LED patterns here cause multi-minute enumeration.
-	uart_puts("Waiting for host PC enumeration...\r\n");
 	led_off();
 	uint32_t dev_wait_start = millis();
 	uint32_t dev_led_toggle = millis();
@@ -278,18 +256,17 @@ int main(void)
 			led_blink_forever(8, 80, 120);
 		}
 	}
-	uart_puts("Host PC configured us!\r\n");
 	led_off();
 
-	// ---- Main proxy loop ----
-	// Non-blocking: interrupt_poll primes on first call, checks on subsequent.
+	// ---- TFT display init (after USB enumeration, before main loop) ----
+#if TFT_ENABLED
+	tft_display_init();
+#endif
+
 	// Hardware NAK rate-limits polling (1 frame = 1ms full-speed, 125us high-speed).
 	uart_puts("\r\n=== PROXY ACTIVE (");
 	uart_putdec(num_ep_mappings);
 	uart_puts(" endpoints) ===\r\n");
-
-	// Diagnostic dump of interrupt schedule state
-	usb_host_interrupt_dump_state();
 
 	uint8_t report_buf[64];
 	uint32_t report_count = 0;
@@ -297,7 +274,13 @@ int main(void)
 	uint32_t loop_count = 0;
 	uint32_t last_heartbeat = millis();
 	uint32_t led_off_time = 0; // non-blocking LED pulse
-	uint32_t last_stats = millis();
+
+#if TFT_ENABLED
+	uint32_t last_tft_update = millis();
+	uint32_t prev_report_count = 0;
+	uint32_t prev_report_time = millis();
+	uint32_t reports_per_sec = 0;
+#endif
 
 	while (1) {
 		usb_device_poll();
@@ -325,21 +308,6 @@ int main(void)
 					drop_count++;
 				}
 
-				// Print first few reports for debugging
-				if (report_count + drop_count <= 5) {
-					uart_puts(sent ? "  FWD " : "  DROP ");
-					uart_puts("EP");
-					uart_putdec(ep_map[m].dev_ep_num);
-					uart_puts(" [");
-					uart_putdec(ret);
-					uart_puts("]: ");
-					for (int i = 0; i < ret && i < 8; i++) {
-						uart_puthex8(report_buf[i]);
-						uart_putc(' ');
-					}
-					uart_puts("\r\n");
-				}
-
 				// Non-blocking LED pulse on forwarded report
 				led_on();
 				led_off_time = millis() + 2;
@@ -352,28 +320,45 @@ int main(void)
 			led_off_time = 0;
 		}
 
-		// Periodic stats every 5 seconds
-		if ((millis() - last_stats) >= 5000) {
-			uart_puts("  reports=");
-			uart_putdec(report_count);
-			uart_puts(" drops=");
-			uart_putdec(drop_count);
-			uart_puts(" PORTSC=0x");
-			uart_puthex32(USB2_PORTSC1);
-			uart_puts("\r\n");
-
-			// Full diag dump every 5s for first 30s
-			if ((millis() - last_stats) < 35000 || report_count == 0) {
-				usb_host_interrupt_dump_state();
-			}
-
-			last_stats = millis();
-		}
-
 		// Send injected-only reports if no real report was merged this cycle
 		kmbox_send_pending(&desc);
 
-		// Disconnect check (every ~1024 iterations, not every loop)
+#if TFT_ENABLED
+		// TFT display update at ~30 Hz (33ms intervals)
+		if ((millis() - last_tft_update) >= 33) {
+			// Compute report rate over the interval
+			uint32_t now = millis();
+			uint32_t dt = now - prev_report_time;
+			if (dt > 0)
+				reports_per_sec = ((report_count - prev_report_count) * 1000) / dt;
+			prev_report_count = report_count;
+			prev_report_time = now;
+
+			tft_proxy_stats_t st = {
+				.host_connected    = usb_host_device_connected(),
+				.device_configured = usb_device_is_configured(),
+				.kmbox_active      = kmbox_frame_count() > 0,
+				.protocol_mode     = 0,
+				.num_endpoints     = num_ep_mappings,
+				.device_speed      = speed,
+				.report_count      = report_count,
+				.drop_count        = drop_count,
+				.reports_per_sec   = reports_per_sec,
+				.smooth_active     = smooth_has_pending(),
+				.smooth_queue_depth = 0,
+				.smooth_queue_max  = SMOOTH_QUEUE_SIZE,
+				.inject_count      = 0,
+				.kmbox_frames_ok   = kmbox_frame_count(),
+				.kmbox_frames_err  = kmbox_error_count(),
+				.uart_rx_bytes     = kmbox_rx_byte_count(),
+				.uptime_sec        = now / 1000,
+			};
+			tft_display_update(&st);
+			last_tft_update = now;
+		}
+#endif
+
+		// Disconnect check
 		if ((++loop_count & 0x3FF) == 0) {
 			if (!usb_host_device_connected()) {
 				uart_puts("Mouse disconnected!\r\n");

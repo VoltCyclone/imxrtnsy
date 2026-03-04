@@ -15,6 +15,8 @@
 #include "usb_device.h"
 #include <string.h>
 
+extern uint32_t millis(void);
+
 // ---- UART constants ----
 #ifndef UART_BAUD
 #define UART_BAUD  115200
@@ -63,6 +65,10 @@ typedef struct {
 	uint8_t  kb_modifier;
 	uint8_t  kb_keys[6];
 	bool     kb_dirty;
+
+	// Click auto-release: mask of buttons to release after click_release_at
+	uint8_t  click_release_mask;
+	uint32_t click_release_at; // millis() timestamp, 0 = inactive
 } kmbox_inject_t;
 
 // ---- Static state ----
@@ -93,6 +99,7 @@ static uint8_t      ferrum_pos;
 static kmbox_inject_t inject;
 static uint32_t frames_ok;
 static uint32_t frames_err;
+static uint32_t rx_bytes_total;
 
 // Track whether a merge happened this cycle (reset each poll)
 static bool merged_this_cycle;
@@ -184,11 +191,20 @@ void kmbox_poll(void)
 		ferrum_pos = 0;
 	}
 
+	// Process pending click release timer
+	if (inject.click_release_at && millis() >= inject.click_release_at) {
+		inject.mouse_buttons &= ~inject.click_release_mask;
+		inject.mouse_dirty = true;
+		inject.click_release_mask = 0;
+		inject.click_release_at = 0;
+	}
+
 	// Drain all DMA-received bytes from ring buffer
 	uint16_t head = ((uint32_t)DMA_TCD0_DADDR - (uint32_t)dma_rx_ring) & (DMA_RX_RING_SIZE - 1);
 	while (rx_tail != head) {
 		uint8_t b = dma_rx_ring[rx_tail];
 		rx_tail = (rx_tail + 1) & (DMA_RX_RING_SIZE - 1);
+		rx_bytes_total++;
 
 		switch (proto_mode) {
 		case PROTO_IDLE:
@@ -467,6 +483,7 @@ void kmbox_inject_smooth(int16_t dx, int16_t dy)
 
 uint32_t kmbox_frame_count(void) { return frames_ok; }
 uint32_t kmbox_error_count(void) { return frames_err; }
+uint32_t kmbox_rx_byte_count(void) { return rx_bytes_total; }
 
 // ---- Internal helpers ----
 
@@ -549,7 +566,7 @@ static void dispatch_kmbox_frame(void)
 	case KMBOX_CMD_KEYBOARD_REL:
 		inject.kb_modifier = 0;
 		memset(inject.kb_keys, 0, 6);
-		inject.kb_dirty = false;
+		inject.kb_dirty = true; // must send zero-report to release keys on host
 		break;
 
 	case KMBOX_CMD_SMOOTH_MOVE:
@@ -579,6 +596,17 @@ static void dispatch_kmbox_frame(void)
 	}
 }
 
+// Send a Makcu binary response: [0x50][cmd][len_lo][len_hi][payload...]
+static void makcu_send_response(uint8_t cmd, const uint8_t *payload, uint8_t plen)
+{
+	uart_tx_byte(MAKCU_SYNC_BYTE);
+	uart_tx_byte(cmd);
+	uart_tx_byte(plen & 0xFF);
+	uart_tx_byte((plen >> 8) & 0xFF);
+	if (plen > 0)
+		uart_tx_bytes(payload, plen);
+}
+
 // ---- Makcu frame dispatch ----
 static void dispatch_makcu_frame(void)
 {
@@ -589,10 +617,29 @@ static void dispatch_makcu_frame(void)
 			                   result.mouse_buttons, result.mouse_wheel,
 			                   false);
 		}
+		if (result.has_keyboard) {
+			inject.kb_modifier = result.kb_modifier;
+			memcpy(inject.kb_keys, result.kb_keys, 6);
+			inject.kb_dirty = true;
+		}
+		if (result.click_release) {
+			// Schedule button release ~30ms after press
+			inject.click_release_mask = result.mouse_buttons;
+			inject.click_release_at = millis() + 30;
+		}
+		if (result.needs_response) {
+			makcu_send_response(result.resp_cmd, result.resp_payload,
+			                    result.resp_payload_len);
+		}
 	}
 }
 
 // ---- Ferrum line dispatch ----
+static void uart_tx_str(const char *s)
+{
+	while (*s) uart_tx_byte((uint8_t)*s++);
+}
+
 static void dispatch_ferrum_line(void)
 {
 	ferrum_result_t result;
@@ -602,8 +649,14 @@ static void dispatch_ferrum_line(void)
 			                   result.mouse_buttons, result.mouse_wheel,
 			                   false);
 		}
+		if (result.click_release) {
+			// Schedule button release ~30ms after click press
+			inject.click_release_mask = result.mouse_buttons;
+			inject.click_release_at = millis() + 30;
+		}
 		if (result.needs_response) {
-			// Send >>> response
+			if (result.text_response)
+				uart_tx_str(result.text_response);
 			static const uint8_t resp[] = { '>', '>', '>', '\r', '\n' };
 			uart_tx_bytes(resp, 5);
 		}

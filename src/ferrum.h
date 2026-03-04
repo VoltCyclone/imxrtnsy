@@ -18,6 +18,9 @@ typedef struct {
 	bool     has_mouse;      // true if mouse state changed
 	bool     has_keyboard;   // true if keyboard command (unsupported)
 	bool     needs_response; // true if >>> response should be sent
+	bool     click_release;  // true = schedule button release after click
+	// Optional text response (for km.version, km.isdown, etc.)
+	const char *text_response; // NULL = no extra text before >>>
 } ferrum_result_t;
 
 // Initialize Ferrum parser (resets button state)

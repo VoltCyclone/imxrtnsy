@@ -2,5 +2,9 @@
 *.elf
 *.hex
 *.bin
+*.uf2
 *.bak
 .DS_Store
+
+# CMake / Pico SDK build
+uart_bridge/build/

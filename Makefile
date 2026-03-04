@@ -11,9 +11,11 @@ MCU_FLAGS = -mcpu=cortex-m7 -mfpu=fpv5-d16 -mfloat-abi=hard -mthumb
 UART ?= 0
 # Override UART baud rate (e.g. make UART_BAUD=921600)
 UART_BAUD ?= 115200
+# Pass TFT=1 to enable ST7735 TFT display (e.g. make TFT=1)
+TFT ?= 1
 
 DEFINES = -DARDUINO_TEENSY41 -D__IMXRT1062__ -DF_CPU=600000000 -DUART_ENABLED=$(UART) \
-          -DUART_BAUD=$(UART_BAUD)
+          -DUART_BAUD=$(UART_BAUD) -DTFT_ENABLED=$(TFT)
 
 CFLAGS = $(MCU_FLAGS) $(DEFINES) \
          -Os -Wall -Wno-unused-variable \
@@ -27,7 +29,8 @@ LDFLAGS = $(MCU_FLAGS) \
 
 CORE_SRC = core/startup.c core/bootdata.c
 SRC      = src/main.c src/uart.c src/usb_host.c src/usb_device.c src/desc_capture.c \
-           src/kmbox.c src/humanize.c src/smooth.c src/ferrum.c src/makcu.c
+           src/kmbox.c src/humanize.c src/smooth.c src/ferrum.c src/makcu.c \
+           src/tft.c src/tft_display.c src/st7735.c src/font6x8.c
 
 OBJ = $(CORE_SRC:.c=.o) $(SRC:.c=.o)
 

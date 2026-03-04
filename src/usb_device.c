@@ -187,15 +187,6 @@ static void handle_get_descriptor(const usb_setup_t *setup)
 		break;
 
 	default:
-		// Device Qualifier (6) and Other Speed Config (7) are expected
-		// stalls for full/low speed only devices.  Log anything else.
-		if (desc_type != 6 && desc_type != 7) {
-			uart_puts("  DEV: unknown desc type 0x");
-			uart_puthex8(desc_type);
-			uart_puts(" idx=");
-			uart_putdec(desc_index);
-			uart_puts("\r\n");
-		}
 		break;
 	}
 
@@ -217,10 +208,6 @@ static void handle_set_address(const usb_setup_t *setup)
 
 	ep0_tx_data(NULL, 0);
 	dev_state = USB_DEV_STATE_ADDRESS;
-
-	uart_puts("  DEV: address set to ");
-	uart_putdec(addr);
-	uart_puts("\r\n");
 }
 
 static void configure_all_interrupt_endpoints(void)
@@ -260,14 +247,6 @@ static void configure_all_interrupt_endpoints(void)
 		*epctrl = USB_ENDPTCTRL_TXE | USB_ENDPTCTRL_TXT(3) | USB_ENDPTCTRL_TXR;
 
 		int_ep_busy[ep_num] = false;
-
-		uart_puts("  DEV: interrupt EP");
-		uart_putdec(ep_num);
-		uart_puts(" IN configured, maxpkt=");
-		uart_putdec(maxpkt);
-		uart_puts(", slot=");
-		uart_putdec(slot);
-		uart_puts("\r\n");
 	}
 }
 
@@ -292,7 +271,6 @@ static void handle_set_configuration(const usb_setup_t *setup)
 	} else {
 		configure_all_interrupt_endpoints();
 		dev_state = USB_DEV_STATE_CONFIGURED;
-		uart_puts("  DEV: configured!\r\n");
 	}
 
 	ep0_tx_data(NULL, 0);
@@ -342,15 +320,6 @@ static void handle_standard_request(const usb_setup_t *setup)
 		ep0_tx_data(NULL, 0);
 		break;
 	default:
-		uart_puts("  DEV: unknown std req 0x");
-		uart_puthex8(setup->bRequest);
-		uart_puts(" bmRT=0x");
-		uart_puthex8(setup->bmRequestType);
-		uart_puts(" wV=0x");
-		uart_puthex16(setup->wValue);
-		uart_puts(" wI=0x");
-		uart_puthex16(setup->wIndex);
-		uart_puts("\r\n");
 		ep0_stall();
 		break;
 	}
@@ -384,9 +353,6 @@ static void handle_class_request(const usb_setup_t *setup)
 		}
 		break;
 	default:
-		uart_puts("  DEV: unknown class req 0x");
-		uart_puthex8(setup->bRequest);
-		uart_puts("\r\n");
 		ep0_stall();
 		break;
 	}
@@ -428,17 +394,6 @@ static void handle_setup_packet(void)
 	} else if (req_type == 0x20) {
 		handle_class_request(&setup);
 	} else {
-		uart_puts("  DEV: unsupported req type=0x");
-		uart_puthex8(setup.bmRequestType);
-		uart_puts(" bReq=0x");
-		uart_puthex8(setup.bRequest);
-		uart_puts(" wV=0x");
-		uart_puthex16(setup.wValue);
-		uart_puts(" wI=0x");
-		uart_puthex16(setup.wIndex);
-		uart_puts(" wL=0x");
-		uart_puthex16(setup.wLength);
-		uart_puts("\r\n");
 		ep0_stall();
 	}
 }
@@ -447,8 +402,6 @@ static void handle_setup_packet(void)
 
 static void handle_bus_reset(void)
 {
-	uart_puts("  DEV: bus reset\r\n");
-
 	USB1_ENDPTSETUPSTAT = USB1_ENDPTSETUPSTAT;
 	USB1_ENDPTCOMPLETE = USB1_ENDPTCOMPLETE;
 
@@ -481,10 +434,6 @@ bool usb_device_init(const captured_descriptors_t *desc)
 	memset(int_ep_busy, 0, sizeof(int_ep_busy));
 	memset(ep_to_slot, 0xFF, sizeof(ep_to_slot));
 	num_int_eps = 0;
-
-	uart_puts("  DEV: init, ");
-	uart_putdec(desc->num_ifaces);
-	uart_puts(" interfaces\r\n");
 
 	// Match PJRC core USB bring-up power rail settings.
 	PMU_REG_3P0 = PMU_REG_3P0_OUTPUT_TRG(0x0F) |
@@ -545,7 +494,6 @@ bool usb_device_init(const captured_descriptors_t *desc)
 	// 8. Start controller (direct assignment, not |=, per PJRC usb.c)
 	USB1_USBCMD = USB_USBCMD_RS;
 
-	uart_puts("  DEV: USB1 device controller running\r\n");
 	return true;
 }
 

@@ -48,3 +48,4 @@ void kmbox_inject_smooth(int16_t dx, int16_t dy);
 // Diagnostic counters
 uint32_t kmbox_frame_count(void);
 uint32_t kmbox_error_count(void);
+uint32_t kmbox_rx_byte_count(void);

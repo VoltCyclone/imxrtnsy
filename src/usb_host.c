@@ -160,12 +160,6 @@ bool usb_host_init(void)
 	USB2_PORTSC1 |= USB_PORTSC1_PP;
 	host_led_mark(4);
 
-	uart_puts("  USB2 PLL locked, PHY up, EHCI running\r\n");
-	uart_puts("  PORTSC1=0x"); uart_puthex32(USB2_PORTSC1); uart_puts("\r\n");
-	uart_puts("  USBCMD =0x"); uart_puthex32(USB2_USBCMD);  uart_puts("\r\n");
-	uart_puts("  USBSTS =0x"); uart_puthex32(USB2_USBSTS);  uart_puts("\r\n");
-	uart_puts("  USBMODE=0x"); uart_puthex32(USB2_USBMODE); uart_puts("\r\n");
-	uart_puts("  GPIO8_DR=0x"); uart_puthex32(GPIO8_DR);    uart_puts("\r\n");
 	return true;
 }
 
@@ -282,9 +276,6 @@ static int execute_transfer(uint32_t timeout_ms)
 		// Check QH overlay for halt (error in any qTD in the chain)
 		uint32_t qh_token = qh_async.token;
 		if (qh_token & QTD_TOKEN_HALTED) {
-			uart_puts("  xfer error, qh token=0x");
-			uart_puthex32(qh_token);
-			uart_puts("\r\n");
 			return -1;
 		}
 
@@ -293,16 +284,12 @@ static int execute_transfer(uint32_t timeout_ms)
 		if (!(st_token & QTD_TOKEN_ACTIVE)) {
 			if (st_token & (QTD_TOKEN_HALTED | QTD_TOKEN_BUFERR |
 				QTD_TOKEN_BABBLE | QTD_TOKEN_XACTERR)) {
-				uart_puts("  xfer error, status token=0x");
-				uart_puthex32(st_token);
-				uart_puts("\r\n");
 				return -1;
 			}
 			return 0; // Success — all qTDs completed
 		}
 
 		if ((millis() - start) > timeout_ms) {
-			uart_puts("  xfer timeout\r\n");
 			return -1;
 		}
 	}
@@ -503,46 +490,10 @@ void usb_host_interrupt_init(uint8_t index, uint8_t addr, uint8_t ep,
 		num_intr_eps = index + 1;
 
 	link_periodic_schedule();
-
-	uart_puts("  HOST: interrupt IN init [");
-	uart_putdec(index);
-	uart_puts("], EP");
-	uart_putdec(ep & 0x0F);
-	uart_puts(", addr=");
-	uart_putdec(addr);
-	uart_puts(", maxpkt=");
-	uart_putdec(maxpkt);
-	uart_puts(", speed=");
-	uart_putdec(device_speed);
-	uart_puts("\r\n");
 }
 
 void usb_host_interrupt_dump_state(void)
 {
-	uart_puts("  INTR diag: USBCMD=0x");
-	uart_puthex32(USB2_USBCMD);
-	uart_puts(" USBSTS=0x");
-	uart_puthex32(USB2_USBSTS);
-	uart_puts(" FRINDEX=0x");
-	uart_puthex32(USB2_FRINDEX);
-	uart_puts("\r\n");
-
-	for (uint8_t i = 0; i < num_intr_eps; i++) {
-		if (!intr_initialized[i]) continue;
-		uart_puts("  QH[");
-		uart_putdec(i);
-		uart_puts("] cap0=0x");
-		uart_puthex32(qh_intr[i].capabilities[0]);
-		uart_puts(" cap1=0x");
-		uart_puthex32(qh_intr[i].capabilities[1]);
-		uart_puts(" token=0x");
-		uart_puthex32(qh_intr[i].token);
-		uart_puts(" next=0x");
-		uart_puthex32(qh_intr[i].next);
-		uart_puts(" hlink=0x");
-		uart_puthex32(qh_intr[i].horizontal_link);
-		uart_puts("\r\n");
-	}
 }
 
 int usb_host_interrupt_poll(uint8_t index, uint8_t *data, uint16_t len)
@@ -593,13 +544,6 @@ int usb_host_interrupt_poll(uint8_t index, uint8_t *data, uint16_t len)
 			asm volatile("dsb" ::: "memory");
 			intr_transfer_active[index] = false;
 			intr_timeout_count[index]++;
-			if (intr_timeout_count[index] <= 5) {
-				uart_puts("  POLL timeout[");
-				uart_putdec(index);
-				uart_puts("] token=0x");
-				uart_puthex32(token);
-				uart_puts("\r\n");
-			}
 			return -1;
 		}
 		return 0;
@@ -609,15 +553,6 @@ int usb_host_interrupt_poll(uint8_t index, uint8_t *data, uint16_t len)
 
 	if (token & QTD_TOKEN_HALTED) {
 		intr_halt_count[index]++;
-		if (intr_halt_count[index] <= 10) {
-			uart_puts("  POLL HALT[");
-			uart_putdec(index);
-			uart_puts("] token=0x");
-			uart_puthex32(token);
-			uart_puts(" (#");
-			uart_putdec(intr_halt_count[index]);
-			uart_puts(")\r\n");
-		}
 		// Clear halt, preserve toggle, allow re-prime
 		qh->token = token & QTD_TOKEN_TOGGLE;
 		qh->next = QTD_TERMINATE;
@@ -627,13 +562,6 @@ int usb_host_interrupt_poll(uint8_t index, uint8_t *data, uint16_t len)
 
 	if (token & (QTD_TOKEN_BUFERR | QTD_TOKEN_BABBLE | QTD_TOKEN_XACTERR)) {
 		intr_error_count[index]++;
-		if (intr_error_count[index] <= 10) {
-			uart_puts("  POLL ERR[");
-			uart_putdec(index);
-			uart_puts("] token=0x");
-			uart_puthex32(token);
-			uart_puts("\r\n");
-		}
 		qh->token = token & QTD_TOKEN_TOGGLE;
 		qh->next = QTD_TERMINATE;
 		asm volatile("dsb" ::: "memory");
