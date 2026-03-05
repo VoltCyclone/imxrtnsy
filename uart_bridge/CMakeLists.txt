@@ -1,14 +1,11 @@
-# UART Bridge for Feather RP2350
+# UART Bridge for Seeed XIAO RP2350
 # USB CDC <-> UART passthrough with NeoPixel status
 # Bridges PC to Teensy 4.1 LPUART6 (KMBox command port)
 
 cmake_minimum_required(VERSION 3.13)
 
-set(PICO_BOARD adafruit_feather_rp2350)
+set(PICO_BOARD seeed_xiao_rp2350)
 set(PICO_PLATFORM rp2350-arm-s)
-
-# Custom board headers
-set(PICO_BOARD_HEADER_DIRS ${CMAKE_CURRENT_LIST_DIR}/../../RaspberryKMBox/boards)
 
 # Pico SDK
 if(NOT DEFINED PICO_SDK_PATH)

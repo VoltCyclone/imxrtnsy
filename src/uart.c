@@ -6,7 +6,7 @@
 #include "imxrt.h"
 #include "uart.h"
 
-#define UART_BAUD 115200
+#define UART_BAUD 2000000
 #define UART_CLOCK 24000000
 
 void uart_init(void)
@@ -27,11 +27,16 @@ void uart_init(void)
 	IOMUXC_SW_PAD_CTL_PAD_GPIO_AD_B0_03 = IOMUXC_PAD_DSE(6) | IOMUXC_PAD_SPEED(2) | IOMUXC_PAD_PKE | IOMUXC_PAD_PUE | IOMUXC_PAD_PUS(3);
 	IOMUXC_LPUART6_RX_SELECT_INPUT = 1;
 
-	// Calculate baud rate
-	// SBR = UART_CLOCK / (BAUD * (OSR + 1))
-	// With OSR=15: SBR = 24000000 / (115200 * 16) = 13.02 -> 13
-	uint32_t osr = 15; // oversample ratio - 1
+	// Baud: pick OSR so SBR >= 1 (e.g. 2M @ 24MHz -> OSR=11, SBR=1)
+	uint32_t osr;
+	if (UART_BAUD <= 460800) {
+		osr = 15;
+	} else {
+		osr = UART_CLOCK / UART_BAUD - 1;
+		if (osr < 4) osr = 4;
+	}
 	uint32_t sbr = UART_CLOCK / (UART_BAUD * (osr + 1));
+	if (sbr == 0) sbr = 1;
 
 	LPUART6_BAUD = LPUART_BAUD_OSR(osr) | LPUART_BAUD_SBR(sbr);
 	LPUART6_CTRL = LPUART_CTRL_TE | LPUART_CTRL_RE; // Enable TX and RX
@@ -48,8 +53,8 @@ void uart_putc(char c)
 	// internal shift-register state and cycles normally even with no
 	// serial cable connected, so this never blocks without hardware.
 	// Timeout guards against UART clock misconfiguration only.
-	// At 600 MHz / 115200 baud, one byte ≈ 52k cycles ≈ 70k loop iters.
-	uint32_t timeout = 80000;
+	// At 600 MHz / 2M baud, one byte ≈ 3k cycles ≈ 5k loop iters.
+	uint32_t timeout = 10000;
 	while (!(LPUART6_STAT & LPUART_STAT_TDRE)) {
 		if (--timeout == 0) return;
 	}

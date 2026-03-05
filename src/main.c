@@ -93,6 +93,80 @@ static void pit0_isr(void)
 // Static to keep off the stack (~3.6KB struct)
 static captured_descriptors_t desc;
 
+// ---- TEMPMON: CPU die temperature ----
+// Calibration from OCOTP fuses (read once at init)
+static uint32_t room_count, hot_count;
+static int32_t  hot_temp;
+
+static void tempmon_init(void)
+{
+	// Enable OCOTP clock for fuse reads
+	CCM_CCGR2 |= CCM_CCGR2_OCOTP_CTRL(CCM_CCGR_ON);
+
+	// Read factory calibration from ANA1 fuse:
+	// bits [31:20] = hot_count, bits [19:8] = hot_temp, bits [7:0] = room_count_offset
+	uint32_t ana1 = HW_OCOTP_ANA1;
+	hot_count  = (ana1 >> 20) & 0xFFF;
+	hot_temp   = (int32_t)((ana1 >> 8) & 0xFFF);
+	room_count = ana1 & 0xFF;
+	// room_count is stored as offset from hot_count in some revisions;
+	// ANA2 has the actual room count on IMXRT1062
+	uint32_t ana2 = HW_OCOTP_ANA2;
+	room_count = (ana2 >> 20) & 0xFFF;
+	if (room_count == 0) room_count = hot_count - 35; // fallback
+
+	// Power up TEMPMON, enable periodic measurement
+	TEMPMON_TEMPSENSE0_CLR = TEMPMON_CTRL0_POWER_DOWN;
+	TEMPMON_TEMPSENSE1 = TEMPMON_CTRL1_MEASURE_FREQ(0x03FF); // ~2Hz
+	TEMPMON_TEMPSENSE0_SET = TEMPMON_CTRL0_MEASURE_TEMP;
+}
+
+static int8_t tempmon_read(void)
+{
+	uint32_t raw = (TEMPMON_TEMPSENSE0 >> 8) & 0xFFF;
+	if (raw == 0) return 0;
+	// T = hot_temp - (raw - hot_count) * (hot_temp - 25) / (room_count - hot_count)
+	int32_t num = ((int32_t)raw - (int32_t)hot_count) * (hot_temp - 25);
+	int32_t den = (int32_t)room_count - (int32_t)hot_count;
+	if (den == 0) return 0;
+	return (int8_t)(hot_temp - num / den);
+}
+
+// ---- USB descriptor helpers for display ----
+static uint16_t desc_vid(void)
+{
+	return (uint16_t)desc.device_desc[8] | ((uint16_t)desc.device_desc[9] << 8);
+}
+
+static uint16_t desc_pid(void)
+{
+	return (uint16_t)desc.device_desc[10] | ((uint16_t)desc.device_desc[11] << 8);
+}
+
+// Decode USB string descriptor (UTF-16LE → ASCII, truncate to outlen-1 chars)
+static void desc_product_string(char *out, int outlen)
+{
+	out[0] = '\0';
+	// iProduct string index is device_desc[15]
+	uint8_t target_idx = desc.device_desc[15];
+	if (target_idx == 0) return;
+
+	// Find this string index in the captured strings
+	for (uint8_t i = 0; i < desc.num_strings; i++) {
+		if (desc.string_index[i] == target_idx && desc.string_desc_len[i] > 2) {
+			const uint8_t *sd = desc.string_desc[i];
+			int slen = (desc.string_desc_len[i] - 2) / 2; // UTF-16 char count
+			if (slen > outlen - 1) slen = outlen - 1;
+			for (int j = 0; j < slen; j++) {
+				uint16_t ch = sd[2 + j * 2] | (sd[3 + j * 2] << 8);
+				out[j] = (ch > 0x7E || ch < 0x20) ? '?' : (char)ch;
+			}
+			out[slen] = '\0';
+			return;
+		}
+	}
+}
+
 int main(void)
 {
 	// Enable SEVONPEND so WFE wakes on any pending interrupt
@@ -109,6 +183,8 @@ int main(void)
 	attachInterruptVector(IRQ_PIT, pit0_isr);
 	NVIC_SET_PRIORITY(IRQ_PIT, 64);
 	NVIC_ENABLE_IRQ(IRQ_PIT);
+
+	tempmon_init();
 
 	uart_puts("\r\n\r\nimxrtnsy: USB proxy\r\n");
 	uart_puts("Teensy 4.1 — i.MX RT1062\r\n\r\n");
@@ -146,6 +222,12 @@ int main(void)
 	}
 
 	uart_puts("\r\n=== CAPTURE COMPLETE ===\r\n");
+
+	// Cache USB descriptor info for display
+	uint16_t usb_vid = desc_vid();
+	uint16_t usb_pid = desc_pid();
+	char usb_product[22];
+	desc_product_string(usb_product, sizeof(usb_product));
 
 	// ---- Phase 2: Device stack + proxy ----
 
@@ -355,7 +437,11 @@ int main(void)
 				.kmbox_frames_err  = kmbox_error_count(),
 				.uart_rx_bytes     = kmbox_rx_byte_count(),
 				.uptime_sec        = now / 1000,
+				.cpu_temp_c        = tempmon_read(),
+				.usb_vid           = usb_vid,
+				.usb_pid           = usb_pid,
 			};
+			__builtin_memcpy(st.usb_product, usb_product, sizeof(usb_product));
 			tft_display_update(&st);
 			last_tft_update = now;
 		}

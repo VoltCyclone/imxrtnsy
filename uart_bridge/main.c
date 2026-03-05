@@ -1,9 +1,9 @@
-// UART Bridge for Feather RP2350
+// UART Bridge for Seeed XIAO RP2350
 // USB CDC <-> UART0 bidirectional passthrough
 // NeoPixel shows status: red=no USB, cyan=idle, green=data
 //
-// Wiring: Feather UART0 TX (GPIO 0) -> Teensy pin 0 (LPUART6 RX)
-//         Feather UART0 RX (GPIO 1) <- Teensy pin 1 (LPUART6 TX)
+// Wiring: XIAO UART0 TX (GPIO 0 / D6) -> Teensy pin 0 (LPUART6 RX)
+//         XIAO UART0 RX (GPIO 1 / D7) <- Teensy pin 1 (LPUART6 TX)
 
 #include <stdlib.h>
 #include <string.h>
@@ -15,12 +15,13 @@
 #include "hardware/clocks.h"
 #include "ws2812.pio.h"
 
-// ---- Pin config (Feather RP2350) ----
-#define UART_ID      uart0
-#define UART_TX_PIN  0
-#define UART_RX_PIN  1
-#define NEOPIXEL_PIN 11
-#define BAUD_RATE    115200
+// ---- Pin config (Seeed XIAO RP2350) ----
+#define UART_ID          uart0
+#define UART_TX_PIN      0
+#define UART_RX_PIN      1
+#define NEOPIXEL_PIN     22
+#define NEOPIXEL_PWR_PIN 23
+#define BAUD_RATE        2000000
 
 // ---- NeoPixel ----
 static PIO  neo_pio;
@@ -38,6 +39,11 @@ static void neo_set(uint8_t r, uint8_t g, uint8_t b)
 
 static void neo_init(void)
 {
+	// XIAO RP2350 requires power pin HIGH to enable NeoPixel
+	gpio_init(NEOPIXEL_PWR_PIN);
+	gpio_set_dir(NEOPIXEL_PWR_PIN, GPIO_OUT);
+	gpio_put(NEOPIXEL_PWR_PIN, 1);
+
 	neo_pio = pio0;
 	uint offset = pio_add_program(neo_pio, &ws2812_program);
 	neo_sm = pio_claim_unused_sm(neo_pio, true);
@@ -90,22 +96,33 @@ int main(void)
 		bool usb_connected = stdio_usb_connected();
 		bool had_data = false;
 
-		// CDC -> UART
-		if (usb_connected) {
-			int ch;
-			while ((ch = getchar_timeout_us(0)) != PICO_ERROR_TIMEOUT) {
-				uart_putc_raw(UART_ID, (char)ch);
-				had_data = true;
-			}
-		}
+		// Interleave CDC->UART and UART->CDC to prevent RX FIFO overflow.
+		// Process a small batch from CDC, then drain all pending UART RX,
+		// and repeat until both are empty.
+		bool did_work;
+		do {
+			did_work = false;
 
-		// UART -> CDC
-		while (uart_is_readable(UART_ID)) {
-			char c = uart_getc(UART_ID);
-			if (usb_connected)
-				putchar_raw(c);
-			had_data = true;
-		}
+			// CDC -> UART (limited batch to let UART RX drain)
+			if (usb_connected) {
+				for (int i = 0; i < 32; i++) {
+					int ch = getchar_timeout_us(0);
+					if (ch == PICO_ERROR_TIMEOUT) break;
+					uart_putc(UART_ID, (char)ch);
+					had_data = true;
+					did_work = true;
+				}
+			}
+
+			// UART -> CDC
+			while (uart_is_readable(UART_ID)) {
+				char c = uart_getc(UART_ID);
+				if (usb_connected)
+					putchar_raw(c);
+				had_data = true;
+				did_work = true;
+			}
+		} while (did_work);
 
 		if (had_data)
 			last_data_ms = to_ms_since_boot(get_absolute_time());
@@ -128,7 +145,7 @@ int main(void)
 				breath_tick(255, 0, 0);    // red breathing
 				break;
 			case ST_IDLE:
-				neo_set(0, 30, 30);        // dim cyan = connected, idle
+				breath_tick(0, 255, 255);   // cyan breathing = running, idle
 				break;
 			case ST_DATA:
 				neo_set(0, 255, 0);        // bright green = data flowing

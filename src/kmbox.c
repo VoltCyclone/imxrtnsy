@@ -19,7 +19,7 @@ extern uint32_t millis(void);
 
 // ---- UART constants ----
 #ifndef UART_BAUD
-#define UART_BAUD  115200
+#define UART_BAUD  2000000
 #endif
 #define UART_CLOCK 24000000
 
@@ -117,6 +117,19 @@ static uint32_t rx_bytes_total;
 static uint8_t  cached_mouse_ep;    // EP number for mouse (0 = not found)
 static uint16_t cached_mouse_maxpkt;
 static uint8_t  cached_kb_ep;       // EP number for keyboard (0 = not found)
+// Mouse report field layout — parsed from HID report descriptor
+static struct {
+	uint16_t x_bit;         // bit offset of X in data (after report ID byte)
+	uint16_t y_bit;         // bit offset of Y
+	uint16_t wheel_bit;     // bit offset of wheel (0xFFFF = none)
+	uint8_t  x_size;        // X field size in bits (8 or 16 typically)
+	uint8_t  y_size;        // Y field size in bits
+	uint8_t  wheel_size;    // wheel field size in bits
+	uint8_t  report_id;     // 0 = no report ID byte
+	uint8_t  data_off;      // byte offset of data start (0 or 1)
+	bool     valid;         // true if X and Y were found
+} mouse_layout;
+static uint8_t cached_mouse_report_len; // actual report length from first real report
 
 // Track whether a merge happened this cycle (reset each poll)
 static bool merged_this_cycle;
@@ -204,8 +217,14 @@ void kmbox_init(void)
 		IOMUXC_PAD_PKE | IOMUXC_PAD_PUE | IOMUXC_PAD_PUS(3);
 	IOMUXC_LPUART6_RX_SELECT_INPUT = 1;
 
-	// Baud: dynamic OSR for high baud rates
-	uint32_t osr = (UART_BAUD > 460800) ? 25 : 15;
+	// Baud: pick OSR so SBR >= 1 (e.g. 2M @ 24MHz -> OSR=11, SBR=1)
+	uint32_t osr;
+	if (UART_BAUD <= 460800) {
+		osr = 15;
+	} else {
+		osr = UART_CLOCK / UART_BAUD - 1;
+		if (osr < 4) osr = 4;
+	}
 	uint32_t sbr = UART_CLOCK / (UART_BAUD * (osr + 1));
 	if (sbr == 0) sbr = 1;
 	LPUART6_BAUD = LPUART_BAUD_OSR(osr) | LPUART_BAUD_SBR(sbr);
@@ -257,22 +276,196 @@ void kmbox_init(void)
 	cached_mouse_ep = 0;
 	cached_mouse_maxpkt = 0;
 	cached_kb_ep = 0;
+	memset(&mouse_layout, 0, sizeof(mouse_layout));
+	mouse_layout.wheel_bit = 0xFFFF;
+	cached_mouse_report_len = 0;
 
 	ferrum_init();
 	makcu_init();
 	smooth_init();
 }
 
+// ---- HID report descriptor parser ----
+
+// Parse mouse HID report descriptor to find X, Y, wheel bit positions and sizes.
+// This is essential because mice vary: 8-bit X/Y (boot-like), 16-bit X/Y (gaming),
+// 12-bit fields, etc.  Without parsing, we'd guess wrong and corrupt reports.
+static void parse_mouse_layout(const uint8_t *rd, uint16_t rdlen)
+{
+	memset(&mouse_layout, 0, sizeof(mouse_layout));
+	mouse_layout.wheel_bit = 0xFFFF;
+
+	uint16_t usage_page = 0;
+	uint8_t  usages[16];
+	uint8_t  num_usages = 0;
+	uint16_t usage_min = 0, usage_max = 0;
+	uint8_t  report_size = 0;
+	uint8_t  report_count = 0;
+	uint8_t  current_rid = 0;
+	uint16_t bit_pos = 0;
+
+	uint16_t i = 0;
+	while (i < rdlen) {
+		uint8_t b = rd[i];
+		if (b == 0xFE) { // long item — skip
+			if (i + 2 < rdlen) i += 3 + rd[i + 1];
+			else break;
+			continue;
+		}
+
+		uint8_t sz = b & 0x03;
+		if (sz == 3) sz = 4;
+		if (i + 1 + sz > rdlen) break;
+
+		// Read unsigned data
+		uint32_t val = 0;
+		if (sz >= 1) val = rd[i + 1];
+		if (sz >= 2) val |= (uint32_t)rd[i + 2] << 8;
+		if (sz >= 4) val |= (uint32_t)rd[i + 3] << 16 | (uint32_t)rd[i + 4] << 24;
+
+		switch (b & 0xFC) {
+		// Global items
+		case 0x04: usage_page = (uint16_t)val; break;   // Usage Page
+		case 0x74: report_size = (uint8_t)val; break;    // Report Size
+		case 0x94: report_count = (uint8_t)val; break;   // Report Count
+		case 0x84:                                        // Report ID
+			current_rid = (uint8_t)val;
+			bit_pos = 0;
+			break;
+
+		// Local items
+		case 0x08: // Usage
+			if (num_usages < 16) usages[num_usages++] = (uint8_t)val;
+			break;
+		case 0x18: usage_min = (uint16_t)val; break;     // Usage Minimum
+		case 0x28: usage_max = (uint16_t)val; break;     // Usage Maximum
+
+		// Main items
+		case 0x80: { // Input
+			// If no explicit usages but Usage Min/Max set, fill from range
+			if (num_usages == 0 && usage_max >= usage_min) {
+				for (uint16_t u = usage_min; u <= usage_max && num_usages < 16; u++)
+					usages[num_usages++] = (uint8_t)u;
+			}
+
+			for (uint8_t f = 0; f < report_count; f++) {
+				uint8_t u = (f < num_usages) ? usages[f] :
+				            (num_usages > 0 ? usages[num_usages - 1] : 0);
+
+				if (usage_page == 0x01) { // Generic Desktop
+					if (u == 0x30) { // X
+						mouse_layout.x_bit = bit_pos;
+						mouse_layout.x_size = report_size;
+						mouse_layout.report_id = current_rid;
+					} else if (u == 0x31) { // Y
+						mouse_layout.y_bit = bit_pos;
+						mouse_layout.y_size = report_size;
+					} else if (u == 0x38) { // Wheel
+						mouse_layout.wheel_bit = bit_pos;
+						mouse_layout.wheel_size = report_size;
+					}
+				}
+				bit_pos += report_size;
+			}
+			// Clear local state after Main item
+			num_usages = 0;
+			usage_min = 0;
+			usage_max = 0;
+			break;
+		}
+		case 0xA0: // Collection
+			num_usages = 0;
+			usage_min = 0;
+			usage_max = 0;
+			break;
+		case 0xC0: // End Collection
+			num_usages = 0;
+			break;
+		}
+
+		i += 1 + sz;
+	}
+
+	mouse_layout.data_off = mouse_layout.report_id ? 1 : 0;
+	mouse_layout.valid = (mouse_layout.x_size > 0 && mouse_layout.y_size > 0);
+}
+
+// Read signed value from bit position in a report buffer.
+// bit_off is relative to data start; data_off is byte offset of data (0 or 1).
+static int32_t read_report_field(const uint8_t *buf, uint16_t bit_off,
+                                 uint8_t bit_size, uint8_t data_off)
+{
+	uint16_t abs_bit = bit_off + (uint16_t)data_off * 8;
+	uint16_t byte_idx = abs_bit >> 3;
+	uint8_t  bit_idx = abs_bit & 7;
+
+	// Fast paths for common byte-aligned fields
+	if (bit_idx == 0) {
+		if (bit_size == 8)  return (int8_t)buf[byte_idx];
+		if (bit_size == 16) return (int16_t)(buf[byte_idx] | ((uint16_t)buf[byte_idx + 1] << 8));
+	}
+
+	// Generic bit-level access
+	uint32_t raw = 0;
+	uint8_t bytes_needed = (bit_idx + bit_size + 7) >> 3;
+	for (uint8_t b = 0; b < bytes_needed; b++)
+		raw |= (uint32_t)buf[byte_idx + b] << (b * 8);
+	raw = (raw >> bit_idx) & ((1u << bit_size) - 1);
+	if (raw & (1u << (bit_size - 1)))
+		raw |= ~((1u << bit_size) - 1); // sign extend
+	return (int32_t)raw;
+}
+
+// Write signed value to bit position in a report buffer.
+static void write_report_field(uint8_t *buf, uint16_t bit_off,
+                               uint8_t bit_size, uint8_t data_off, int32_t value)
+{
+	uint16_t abs_bit = bit_off + (uint16_t)data_off * 8;
+	uint16_t byte_idx = abs_bit >> 3;
+	uint8_t  bit_idx = abs_bit & 7;
+
+	// Fast paths
+	if (bit_idx == 0) {
+		if (bit_size == 8) {
+			buf[byte_idx] = (uint8_t)(int8_t)value;
+			return;
+		}
+		if (bit_size == 16) {
+			buf[byte_idx]     = (uint8_t)(value & 0xFF);
+			buf[byte_idx + 1] = (uint8_t)((value >> 8) & 0xFF);
+			return;
+		}
+	}
+
+	// Generic bit-level write
+	uint32_t mask = ((1u << bit_size) - 1) << bit_idx;
+	uint32_t val  = ((uint32_t)value & ((1u << bit_size) - 1)) << bit_idx;
+	uint8_t bytes_needed = (bit_idx + bit_size + 7) >> 3;
+	for (uint8_t b = 0; b < bytes_needed; b++) {
+		uint8_t m = (mask >> (b * 8)) & 0xFF;
+		uint8_t v = (val  >> (b * 8)) & 0xFF;
+		buf[byte_idx + b] = (buf[byte_idx + b] & ~m) | v;
+	}
+}
+
 void kmbox_cache_endpoints(const captured_descriptors_t *desc)
 {
 	cached_mouse_ep = 0;
 	cached_kb_ep = 0;
+	memset(&mouse_layout, 0, sizeof(mouse_layout));
+	mouse_layout.wheel_bit = 0xFFFF;
+	cached_mouse_report_len = 0;
 	for (uint8_t i = 0; i < desc->num_ifaces; i++) {
 		if (desc->ifaces[i].interrupt_ep == 0) continue;
 		uint8_t ep = desc->ifaces[i].interrupt_ep & 0x0F;
 		if (desc->ifaces[i].iface_protocol == 2 && !cached_mouse_ep) {
 			cached_mouse_ep = ep;
 			cached_mouse_maxpkt = desc->ifaces[i].interrupt_maxpkt;
+
+			// Parse HID report descriptor to find exact X/Y/wheel
+			// field positions and sizes — essential for correct merge.
+			parse_mouse_layout(desc->ifaces[i].hid_report_desc,
+			                   desc->ifaces[i].hid_report_desc_len);
 		} else if (desc->ifaces[i].iface_protocol == 1 && !cached_kb_ep) {
 			cached_kb_ep = ep;
 		}
@@ -442,50 +635,55 @@ void kmbox_poll(void)
 
 void kmbox_merge_report(uint8_t iface_protocol, uint8_t *report, uint8_t len)
 {
-	if (iface_protocol == 2 && inject.mouse_dirty) {
-		// Mouse merge — buttons OR, deltas add
-		report[0] |= inject.mouse_buttons;
+	if (iface_protocol == 2) {
+		// Cache actual report length for synthetic report construction
+		if (cached_mouse_report_len == 0)
+			cached_mouse_report_len = len;
 
-		if (len == 3) {
-			// Boot protocol: X and Y are int8
-			int16_t mx = (int8_t)report[1] + inject.mouse_dx;
-			int16_t my = (int8_t)report[2] + inject.mouse_dy;
-			if (mx > 127) mx = 127;
-			if (mx < -127) mx = -127;
-			if (my > 127) my = 127;
-			if (my < -127) my = -127;
-			report[1] = (uint8_t)(int8_t)mx;
-			report[2] = (uint8_t)(int8_t)my;
-		} else if (len >= 5) {
-			// Extended: X and Y are int16 LE at bytes 1-4
-			int32_t rx = (int16_t)(report[1] | (report[2] << 8));
-			int32_t ry = (int16_t)(report[3] | (report[4] << 8));
+		if (inject.mouse_dirty && mouse_layout.valid) {
+			uint8_t doff = mouse_layout.data_off;
+
+			// Buttons: OR into first data byte (standard for all mice)
+			report[doff] |= inject.mouse_buttons;
+
+			// X: read current, add injection, clamp, write back
+			int32_t x_max = (1 << (mouse_layout.x_size - 1)) - 1;
+			int32_t rx = read_report_field(report, mouse_layout.x_bit,
+			                               mouse_layout.x_size, doff);
 			int32_t mx = rx + inject.mouse_dx;
+			if (mx > x_max) mx = x_max;
+			if (mx < -x_max) mx = -x_max;
+			write_report_field(report, mouse_layout.x_bit,
+			                   mouse_layout.x_size, doff, mx);
+
+			// Y: same pattern
+			int32_t y_max = (1 << (mouse_layout.y_size - 1)) - 1;
+			int32_t ry = read_report_field(report, mouse_layout.y_bit,
+			                               mouse_layout.y_size, doff);
 			int32_t my = ry + inject.mouse_dy;
-			if (mx > 32767) mx = 32767;
-			if (mx < -32767) mx = -32767;
-			if (my > 32767) my = 32767;
-			if (my < -32767) my = -32767;
-			report[1] = mx & 0xFF;
-			report[2] = (mx >> 8) & 0xFF;
-			report[3] = my & 0xFF;
-			report[4] = (my >> 8) & 0xFF;
+			if (my > y_max) my = y_max;
+			if (my < -y_max) my = -y_max;
+			write_report_field(report, mouse_layout.y_bit,
+			                   mouse_layout.y_size, doff, my);
 
-			if (len >= 6 && inject.mouse_wheel != 0) {
-				int16_t w = (int8_t)report[5] + inject.mouse_wheel;
-				if (w > 127) w = 127;
-				if (w < -127) w = -127;
-				report[5] = (uint8_t)(int8_t)w;
+			// Wheel (if present and non-zero injection)
+			if (mouse_layout.wheel_bit != 0xFFFF && inject.mouse_wheel != 0) {
+				int32_t w_max = (1 << (mouse_layout.wheel_size - 1)) - 1;
+				int32_t rw = read_report_field(report, mouse_layout.wheel_bit,
+				                               mouse_layout.wheel_size, doff);
+				int32_t mw = rw + inject.mouse_wheel;
+				if (mw > w_max) mw = w_max;
+				if (mw < -w_max) mw = -w_max;
+				write_report_field(report, mouse_layout.wheel_bit,
+				                   mouse_layout.wheel_size, doff, mw);
 			}
+
+			inject.mouse_dx = 0;
+			inject.mouse_dy = 0;
+			inject.mouse_wheel = 0;
+			inject.mouse_dirty = false;
+			merged_this_cycle = true;
 		}
-
-		// Clear one-shot deltas after merge
-		inject.mouse_dx = 0;
-		inject.mouse_dy = 0;
-		inject.mouse_wheel = 0;
-		inject.mouse_dirty = false;
-		merged_this_cycle = true;
-
 	} else if (iface_protocol == 1 && inject.kb_dirty) {
 		// Keyboard merge (8-byte boot report)
 		if (len >= 8) {
@@ -518,31 +716,40 @@ void kmbox_send_pending(void)
 	if (merged_this_cycle) return;
 
 	// Send synthetic mouse report if dirty (direct EP, no iface scan)
-	if (inject.mouse_dirty && cached_mouse_ep) {
-		uint8_t synth[8];
+	if (inject.mouse_dirty && cached_mouse_ep && mouse_layout.valid) {
+		uint8_t synth[16];
 		memset(synth, 0, sizeof(synth));
-		synth[0] = inject.mouse_buttons;
+		uint8_t doff = mouse_layout.data_off;
+		if (doff) synth[0] = mouse_layout.report_id;
+		synth[doff] = inject.mouse_buttons;
 
-		uint8_t rlen;
-		if (cached_mouse_maxpkt <= 3) {
-			int16_t dx = inject.mouse_dx;
-			int16_t dy = inject.mouse_dy;
-			if (dx > 127) dx = 127;
-			if (dx < -127) dx = -127;
-			if (dy > 127) dy = 127;
-			if (dy < -127) dy = -127;
-			synth[1] = (uint8_t)(int8_t)dx;
-			synth[2] = (uint8_t)(int8_t)dy;
-			rlen = 3;
-		} else {
-			synth[1] = inject.mouse_dx & 0xFF;
-			synth[2] = (inject.mouse_dx >> 8) & 0xFF;
-			synth[3] = inject.mouse_dy & 0xFF;
-			synth[4] = (inject.mouse_dy >> 8) & 0xFF;
-			synth[5] = (uint8_t)inject.mouse_wheel;
-			rlen = (cached_mouse_maxpkt < 8) ? (uint8_t)cached_mouse_maxpkt : 8;
+		// Clamp to field range and write at correct bit positions
+		int32_t x_max = (1 << (mouse_layout.x_size - 1)) - 1;
+		int32_t y_max = (1 << (mouse_layout.y_size - 1)) - 1;
+		int32_t dx = inject.mouse_dx;
+		int32_t dy = inject.mouse_dy;
+		if (dx > x_max) dx = x_max;
+		if (dx < -x_max) dx = -x_max;
+		if (dy > y_max) dy = y_max;
+		if (dy < -y_max) dy = -y_max;
+
+		write_report_field(synth, mouse_layout.x_bit,
+		                   mouse_layout.x_size, doff, dx);
+		write_report_field(synth, mouse_layout.y_bit,
+		                   mouse_layout.y_size, doff, dy);
+
+		if (mouse_layout.wheel_bit != 0xFFFF && inject.mouse_wheel != 0) {
+			int32_t w_max = (1 << (mouse_layout.wheel_size - 1)) - 1;
+			int32_t w = inject.mouse_wheel;
+			if (w > w_max) w = w_max;
+			if (w < -w_max) w = -w_max;
+			write_report_field(synth, mouse_layout.wheel_bit,
+			                   mouse_layout.wheel_size, doff, w);
 		}
 
+		// Use actual report length seen from real device; fall back to maxpkt
+		uint8_t rlen = cached_mouse_report_len;
+		if (rlen == 0) rlen = (cached_mouse_maxpkt < 16) ? (uint8_t)cached_mouse_maxpkt : 16;
 		usb_device_send_report(cached_mouse_ep, synth, rlen);
 
 		inject.mouse_dx = 0;
@@ -687,7 +894,7 @@ static void dispatch_makcu_frame(void)
 		if (result.has_mouse) {
 			apply_mouse_result(result.mouse_dx, result.mouse_dy,
 			                   result.mouse_buttons, result.mouse_wheel,
-			                   false);
+			                   true);
 		}
 		if (result.has_keyboard) {
 			inject.kb_modifier = result.kb_modifier;
@@ -714,7 +921,7 @@ static void dispatch_ferrum_line(void)
 		if (result.has_mouse) {
 			apply_mouse_result(result.mouse_dx, result.mouse_dy,
 			                   result.mouse_buttons, result.mouse_wheel,
-			                   false);
+			                   true);
 		}
 		if (result.click_release) {
 			// Schedule button release ~30ms after click press

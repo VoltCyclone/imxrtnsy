@@ -31,6 +31,25 @@ static int fmt_done(char *start, char *end)
 	return (int)(end - start);
 }
 
+static char *u16_to_hex4(char *buf, uint16_t v)
+{
+	static const char hex[] = "0123456789ABCDEF";
+	*buf++ = hex[(v >> 12) & 0xF];
+	*buf++ = hex[(v >> 8) & 0xF];
+	*buf++ = hex[(v >> 4) & 0xF];
+	*buf++ = hex[v & 0xF];
+	return buf;
+}
+
+static char *i8_to_str(char *buf, int8_t v)
+{
+	if (v < 0) { *buf++ = '-'; v = -v; }
+	if (v >= 100) { *buf++ = '0' + v / 100; v %= 100; }
+	if (v >= 10 || buf[-1] != '-') *buf++ = '0' + v / 10;
+	*buf++ = '0' + v % 10;
+	return buf;
+}
+
 // ---- Layout constants ----
 #define FW   TFT_FONT_W
 #define FH   TFT_FONT_H
@@ -172,13 +191,13 @@ static void draw_stats(const tft_proxy_stats_t *s)
 	// Line 14: separator
 	draw_separator(LINE(14));
 
-	// Line 15: Uptime
+	// Line 15: Uptime + CPU temp
 	{
 		uint32_t sec = s->uptime_sec;
 		uint32_t hr  = sec / 3600;
 		uint32_t min = (sec / 60) % 60;
 		uint32_t s2  = sec % 60;
-		tft_draw_string(COL(0), LINE(15), COL_GRAY, "Uptime:");
+		tft_draw_string(COL(0), LINE(15), COL_GRAY, "Up:");
 		p = buf;
 		p = u32_to_str02(p, hr);
 		*p++ = ':';
@@ -186,7 +205,35 @@ static void draw_stats(const tft_proxy_stats_t *s)
 		*p++ = ':';
 		p = u32_to_str02(p, s2);
 		fmt_done(buf, p);
-		tft_draw_string(COL(7), LINE(15), COL_WHITE, buf);
+		tft_draw_string(COL(3), LINE(15), COL_WHITE, buf);
+
+		tft_draw_string(COL(14), LINE(15), COL_GRAY, "CPU:");
+		p = buf;
+		p = i8_to_str(p, s->cpu_temp_c);
+		*p++ = 'C';
+		fmt_done(buf, p);
+		uint8_t tcol = (s->cpu_temp_c > 80) ? COL_RED :
+		               (s->cpu_temp_c > 60) ? COL_YELLOW : COL_GREEN;
+		tft_draw_string(COL(18), LINE(15), tcol, buf);
+	}
+
+	// Line 16: separator
+	draw_separator(LINE(16));
+
+	// Line 17: VID:PID
+	{
+		tft_draw_string(COL(0), LINE(17), COL_GRAY, "USB:");
+		p = buf;
+		p = u16_to_hex4(p, s->usb_vid);
+		*p++ = ':';
+		p = u16_to_hex4(p, s->usb_pid);
+		fmt_done(buf, p);
+		tft_draw_string(COL(4), LINE(17), COL_WHITE, buf);
+	}
+
+	// Line 18-19: Product name
+	if (s->usb_product[0]) {
+		tft_draw_string(COL(0), LINE(18), COL_DARK, s->usb_product);
 	}
 }
 

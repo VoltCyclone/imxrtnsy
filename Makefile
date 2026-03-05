@@ -10,7 +10,7 @@ MCU_FLAGS = -mcpu=cortex-m7 -mfpu=fpv5-d16 -mfloat-abi=hard -mthumb
 # Pass UART=1 on command line to enable debug UART output (e.g. make UART=1)
 UART ?= 0
 # Override UART baud rate (e.g. make UART_BAUD=921600)
-UART_BAUD ?= 115200
+UART_BAUD ?= 2000000
 # Pass TFT=1 to enable ST7735 TFT display (e.g. make TFT=1)
 TFT ?= 1
 
@@ -34,7 +34,9 @@ SRC      = src/main.c src/uart.c src/usb_host.c src/usb_device.c src/desc_captur
 
 OBJ = $(CORE_SRC:.c=.o) $(SRC:.c=.o)
 
-all: $(TARGET).hex
+BRIDGE_BUILD = uart_bridge/build
+
+all: $(TARGET).hex bridge
 	@$(SIZE) $(TARGET).elf
 
 $(TARGET).elf: $(OBJ)
@@ -50,10 +52,20 @@ $(HOT_SRC): CFLAGS := $(subst -Os,-O2,$(CFLAGS))
 %.o: %.c
 	$(CC) $(CFLAGS) -c -o $@ $<
 
+bridge: $(BRIDGE_BUILD)/uart_bridge.uf2
+
+$(BRIDGE_BUILD)/uart_bridge.uf2: uart_bridge/main.c uart_bridge/CMakeLists.txt
+	@mkdir -p $(BRIDGE_BUILD)
+	cd $(BRIDGE_BUILD) && cmake .. && $(MAKE)
+
 flash: $(TARGET).hex
 	teensy_loader_cli --mcu=TEENSY41 -w -v $(TARGET).hex
 
+flash-bridge: $(BRIDGE_BUILD)/uart_bridge.uf2
+	@echo "Copy $(BRIDGE_BUILD)/uart_bridge.uf2 to the RP2350 (mount as USB drive)"
+
 clean:
 	rm -f $(OBJ) $(TARGET).elf $(TARGET).hex
+	rm -rf $(BRIDGE_BUILD)
 
-.PHONY: all flash clean
+.PHONY: all flash flash-bridge bridge clean

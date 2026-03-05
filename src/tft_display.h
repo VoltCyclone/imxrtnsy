@@ -36,6 +36,12 @@ typedef struct {
 
 	// System
 	uint32_t uptime_sec;
+	int8_t   cpu_temp_c;        // CPU die temperature in °C
+
+	// USB device descriptor
+	uint16_t usb_vid;
+	uint16_t usb_pid;
+	char     usb_product[22];   // truncated product name (21 chars + null)
 } tft_proxy_stats_t;
 
 // Initialize display hardware + draw splash screen
