@@ -9,8 +9,6 @@
 
 #define MAKCU_SYNC         0x50
 #define MAKCU_MAX_PAYLOAD  64   // we only handle mouse commands, 64 is plenty
-
-// Makcu mouse command codes
 #define MAKCU_CMD_MOVE          0x0D
 #define MAKCU_CMD_MO            0x0B
 #define MAKCU_CMD_CLICK         0x04
@@ -20,8 +18,6 @@
 #define MAKCU_CMD_MIDDLE_BUTTON 0x0A
 #define MAKCU_CMD_SIDE1_BUTTON  0x12
 #define MAKCU_CMD_SIDE2_BUTTON  0x13
-
-// Makcu keyboard command codes
 #define MAKCU_CMD_KB_DISABLE    0xA1
 #define MAKCU_CMD_KB_DOWN       0xA2
 #define MAKCU_CMD_KB_INIT       0xA3
@@ -32,8 +28,6 @@
 #define MAKCU_CMD_KB_REMAP      0xA8
 #define MAKCU_CMD_KB_STRING     0xA9
 #define MAKCU_CMD_KB_UP         0xAA
-
-// Makcu system command codes
 #define MAKCU_CMD_BAUD          0xB1
 #define MAKCU_CMD_BYPASS        0xB2
 #define MAKCU_CMD_DEVICE        0xB3
@@ -48,8 +42,6 @@
 #define MAKCU_CMD_SCREEN        0xBD
 #define MAKCU_CMD_SERIAL        0xBE
 #define MAKCU_CMD_VERSION       0xBF
-
-// Result of parsing a Makcu command
 typedef struct {
 	int16_t  mouse_dx;
 	int16_t  mouse_dy;
@@ -67,11 +59,6 @@ typedef struct {
 	uint8_t  resp_payload[32];
 	uint8_t  resp_payload_len;
 } makcu_result_t;
-
-// Initialize Makcu parser (resets button state)
 void makcu_init(void);
-
-// Parse a complete Makcu command (cmd + payload, after sync+header already stripped).
-// Returns true if the command was recognized and produced mouse output.
 bool makcu_parse_command(uint8_t cmd, const uint8_t *payload, uint16_t len,
                          makcu_result_t *out);

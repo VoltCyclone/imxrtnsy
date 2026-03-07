@@ -128,6 +128,9 @@ static struct {
 	uint8_t  report_id;     // 0 = no report ID byte
 	uint8_t  data_off;      // byte offset of data start (0 or 1)
 	bool     valid;         // true if X and Y were found
+	int16_t  x_max;         // precomputed (1 << (x_size-1)) - 1
+	int16_t  y_max;         // precomputed (1 << (y_size-1)) - 1
+	int16_t  w_max;         // precomputed (1 << (wheel_size-1)) - 1
 } mouse_layout;
 static uint8_t cached_mouse_report_len; // actual report length from first real report
 
@@ -181,24 +184,13 @@ static void tx_flush(void)
 	}
 	if (count == 0) return;
 
-	// Set up TCD2: dma_tx_buf[0..count-1] -> LPUART6_DATA, 1 byte per TDRE
+	// Update only the 3 TCD fields that change per flush (static fields set in kmbox_init)
 	DMA_TCD2_SADDR = (volatile const void *)dma_tx_buf;
-	DMA_TCD2_SOFF = 1;
-	DMA_TCD2_ATTR = DMA_TCD_ATTR_SSIZE(DMA_TCD_ATTR_SIZE_8BIT) |
-	                DMA_TCD_ATTR_DSIZE(DMA_TCD_ATTR_SIZE_8BIT);
-	DMA_TCD2_NBYTES_MLNO = 1;
-	DMA_TCD2_SLAST = 0;
-	DMA_TCD2_DADDR = (volatile void *)&LPUART6_DATA;
-	DMA_TCD2_DOFF = 0;
 	DMA_TCD2_CITER_ELINKNO = count;
 	DMA_TCD2_BITER_ELINKNO = count;
-	DMA_TCD2_DLASTSGA = 0;
 	DMA_TCD2_CSR = DMA_TCD_CSR_DREQ; // auto-disable requests on completion
 	DMA_SERQ = 2; // enable channel 2 requests — DMA fires on each TDRE
 }
-
-// ---- Public API ----
-
 void kmbox_init(void)
 {
 	// Enable LPUART6 clock gate
@@ -229,6 +221,10 @@ void kmbox_init(void)
 	if (sbr == 0) sbr = 1;
 	LPUART6_BAUD = LPUART_BAUD_OSR(osr) | LPUART_BAUD_SBR(sbr);
 
+	// Disable TE/RE before FIFO config (required by i.MX RT datasheet).
+	// uart_init() may have already enabled them when UART_ENABLED=1.
+	LPUART6_CTRL = 0;
+
 	// Enable 4-entry RX and TX hardware FIFOs (must be set while TE/RE clear)
 	LPUART6_FIFO = LPUART_FIFO_RXFE | LPUART_FIFO_TXFE;
 	LPUART6_FIFO |= LPUART_FIFO_TXFLUSH | LPUART_FIFO_RXFLUSH;
@@ -257,8 +253,17 @@ void kmbox_init(void)
 	rx_tail = 0;
 
 	// ---- eDMA channel 2: dma_tx_buf -> LPUART6 TX ----
+	// Pre-fill static TCD fields once; tx_flush only updates SADDR/CITER/BITER.
 	DMAMUX_CHCFG2 = 0;
-	DMA_TCD2_CSR = 0;
+	DMA_TCD2_SADDR = (volatile const void *)dma_tx_buf;
+	DMA_TCD2_SOFF = 1;
+	DMA_TCD2_ATTR = DMA_TCD_ATTR_SSIZE(DMA_TCD_ATTR_SIZE_8BIT) |
+	                DMA_TCD_ATTR_DSIZE(DMA_TCD_ATTR_SIZE_8BIT);
+	DMA_TCD2_NBYTES_MLNO = 1;
+	DMA_TCD2_SLAST = 0;
+	DMA_TCD2_DADDR = (volatile void *)&LPUART6_DATA;
+	DMA_TCD2_DOFF = 0;
+	DMA_TCD2_DLASTSGA = 0;
 	DMA_TCD2_CSR = DMA_TCD_CSR_DONE; // mark idle so first tx_flush succeeds
 	DMAMUX_CHCFG2 = DMAMUX_SOURCE_LPUART6_TX | DMAMUX_CHCFG_ENBL;
 	LPUART6_BAUD |= LPUART_BAUD_TDMAE; // route TX FIFO ready to DMA
@@ -282,7 +287,7 @@ void kmbox_init(void)
 
 	ferrum_init();
 	makcu_init();
-	smooth_init();
+	smooth_init(1000); // default 1kHz, main.c re-inits with actual rate
 }
 
 // ---- HID report descriptor parser ----
@@ -324,7 +329,6 @@ static void parse_mouse_layout(const uint8_t *rd, uint16_t rdlen)
 		if (sz >= 4) val |= (uint32_t)rd[i + 3] << 16 | (uint32_t)rd[i + 4] << 24;
 
 		switch (b & 0xFC) {
-		// Global items
 		case 0x04: usage_page = (uint16_t)val; break;   // Usage Page
 		case 0x74: report_size = (uint8_t)val; break;    // Report Size
 		case 0x94: report_count = (uint8_t)val; break;   // Report Count
@@ -333,16 +337,13 @@ static void parse_mouse_layout(const uint8_t *rd, uint16_t rdlen)
 			bit_pos = 0;
 			break;
 
-		// Local items
 		case 0x08: // Usage
 			if (num_usages < 16) usages[num_usages++] = (uint8_t)val;
 			break;
 		case 0x18: usage_min = (uint16_t)val; break;     // Usage Minimum
 		case 0x28: usage_max = (uint16_t)val; break;     // Usage Maximum
 
-		// Main items
 		case 0x80: { // Input
-			// If no explicit usages but Usage Min/Max set, fill from range
 			if (num_usages == 0 && usage_max >= usage_min) {
 				for (uint16_t u = usage_min; u <= usage_max && num_usages < 16; u++)
 					usages[num_usages++] = (uint8_t)u;
@@ -388,6 +389,9 @@ static void parse_mouse_layout(const uint8_t *rd, uint16_t rdlen)
 
 	mouse_layout.data_off = mouse_layout.report_id ? 1 : 0;
 	mouse_layout.valid = (mouse_layout.x_size > 0 && mouse_layout.y_size > 0);
+	mouse_layout.x_max = mouse_layout.x_size > 0 ? (int16_t)((1 << (mouse_layout.x_size - 1)) - 1) : 0;
+	mouse_layout.y_max = mouse_layout.y_size > 0 ? (int16_t)((1 << (mouse_layout.y_size - 1)) - 1) : 0;
+	mouse_layout.w_max = mouse_layout.wheel_size > 0 ? (int16_t)((1 << (mouse_layout.wheel_size - 1)) - 1) : 0;
 }
 
 // Read signed value from bit position in a report buffer.
@@ -399,13 +403,11 @@ static int32_t read_report_field(const uint8_t *buf, uint16_t bit_off,
 	uint16_t byte_idx = abs_bit >> 3;
 	uint8_t  bit_idx = abs_bit & 7;
 
-	// Fast paths for common byte-aligned fields
-	if (bit_idx == 0) {
-		if (bit_size == 8)  return (int8_t)buf[byte_idx];
+	if (__builtin_expect(bit_idx == 0, 1)) {
 		if (bit_size == 16) return (int16_t)(buf[byte_idx] | ((uint16_t)buf[byte_idx + 1] << 8));
+		if (bit_size == 8)  return (int8_t)buf[byte_idx];
 	}
 
-	// Generic bit-level access
 	uint32_t raw = 0;
 	uint8_t bytes_needed = (bit_idx + bit_size + 7) >> 3;
 	for (uint8_t b = 0; b < bytes_needed; b++)
@@ -416,7 +418,6 @@ static int32_t read_report_field(const uint8_t *buf, uint16_t bit_off,
 	return (int32_t)raw;
 }
 
-// Write signed value to bit position in a report buffer.
 static void write_report_field(uint8_t *buf, uint16_t bit_off,
                                uint8_t bit_size, uint8_t data_off, int32_t value)
 {
@@ -424,20 +425,18 @@ static void write_report_field(uint8_t *buf, uint16_t bit_off,
 	uint16_t byte_idx = abs_bit >> 3;
 	uint8_t  bit_idx = abs_bit & 7;
 
-	// Fast paths
-	if (bit_idx == 0) {
-		if (bit_size == 8) {
-			buf[byte_idx] = (uint8_t)(int8_t)value;
-			return;
-		}
+	if (__builtin_expect(bit_idx == 0, 1)) {
 		if (bit_size == 16) {
 			buf[byte_idx]     = (uint8_t)(value & 0xFF);
 			buf[byte_idx + 1] = (uint8_t)((value >> 8) & 0xFF);
 			return;
 		}
+		if (bit_size == 8) {
+			buf[byte_idx] = (uint8_t)(int8_t)value;
+			return;
+		}
 	}
 
-	// Generic bit-level write
 	uint32_t mask = ((1u << bit_size) - 1) << bit_idx;
 	uint32_t val  = ((uint32_t)value & ((1u << bit_size) - 1)) << bit_idx;
 	uint8_t bytes_needed = (bit_idx + bit_size + 7) >> 3;
@@ -461,9 +460,6 @@ void kmbox_cache_endpoints(const captured_descriptors_t *desc)
 		if (desc->ifaces[i].iface_protocol == 2 && !cached_mouse_ep) {
 			cached_mouse_ep = ep;
 			cached_mouse_maxpkt = desc->ifaces[i].interrupt_maxpkt;
-
-			// Parse HID report descriptor to find exact X/Y/wheel
-			// field positions and sizes — essential for correct merge.
 			parse_mouse_layout(desc->ifaces[i].hid_report_desc,
 			                   desc->ifaces[i].hid_report_desc_len);
 		} else if (desc->ifaces[i].iface_protocol == 1 && !cached_kb_ep) {
@@ -475,27 +471,21 @@ void kmbox_cache_endpoints(const captured_descriptors_t *desc)
 void kmbox_poll(void)
 {
 	merged_this_cycle = false;
-
-	// Kick DMA TX if there are pending bytes (non-blocking)
 	tx_flush();
-
-	// Clear line errors and reset parser if any occurred
 	uint32_t stat = LPUART6_STAT;
-	if (stat & (LPUART_STAT_OR | LPUART_STAT_FE | LPUART_STAT_NF)) {
+	if (__builtin_expect(stat & (LPUART_STAT_OR | LPUART_STAT_FE | LPUART_STAT_NF), 0)) {
 		LPUART6_STAT = stat & (LPUART_STAT_OR | LPUART_STAT_FE | LPUART_STAT_NF);
 		proto_mode = PROTO_IDLE;
 		ferrum_pos = 0;
 	}
 
-	// Process pending click release timer
-	if (inject.click_release_at && millis() >= inject.click_release_at) {
+	if (__builtin_expect(inject.click_release_at, 0) && millis() >= inject.click_release_at) {
 		inject.mouse_buttons &= ~inject.click_release_mask;
 		inject.mouse_dirty = true;
 		inject.click_release_mask = 0;
 		inject.click_release_at = 0;
 	}
 
-	// Drain all DMA-received bytes from ring buffer
 	uint16_t head = ((uint32_t)DMA_TCD0_DADDR - (uint32_t)dma_rx_ring) & (DMA_RX_RING_SIZE - 1);
 	while (rx_tail != head) {
 		uint8_t b = dma_rx_ring[rx_tail];
@@ -504,26 +494,19 @@ void kmbox_poll(void)
 
 		switch (proto_mode) {
 		case PROTO_IDLE:
-			// Auto-detect protocol from first byte
 			if (b == KMBOX_SYNC1) {
-				// KMBox B: first sync byte 0x57
 				proto_mode = PROTO_KMBOX;
 				frame_checksum = b;
 				kb_parse_state = KB_SYNC2;
 			} else if (b == MAKCU_SYNC_BYTE) {
-				// Makcu: sync byte 0x50
 				proto_mode = PROTO_MAKCU;
 				mk_parse_state = MK_CMD;
 			} else if (b >= 0x20 && b < 0x7F) {
-				// Printable ASCII — start Ferrum text line
 				proto_mode = PROTO_FERRUM;
 				ferrum_pos = 0;
 				ferrum_line[ferrum_pos++] = (char)b;
 			}
-			// else: discard non-printable, non-sync bytes
 			break;
-
-		// ---- KMBox B binary protocol ----
 		case PROTO_KMBOX:
 			switch (kb_parse_state) {
 			case KB_SYNC2:
@@ -531,7 +514,6 @@ void kmbox_poll(void)
 					frame_checksum += b;
 					kb_parse_state = KB_CMD;
 				} else if (b == KMBOX_SYNC1) {
-					// Could be restart — keep sync1 checksum
 					frame_checksum = b;
 				} else {
 					proto_mode = PROTO_IDLE;
@@ -574,7 +556,6 @@ void kmbox_poll(void)
 			}
 			break;
 
-		// ---- Makcu binary protocol ----
 		case PROTO_MAKCU:
 			switch (mk_parse_state) {
 			case MK_CMD:
@@ -609,11 +590,8 @@ void kmbox_poll(void)
 				break;
 			}
 			break;
-
-		// ---- Ferrum text protocol ----
 		case PROTO_FERRUM:
 			if (b == '\n' || b == '\r') {
-				// End of line — dispatch
 				if (ferrum_pos > 0) {
 					ferrum_line[ferrum_pos] = '\0';
 					dispatch_ferrum_line();
@@ -623,7 +601,6 @@ void kmbox_poll(void)
 			} else if (ferrum_pos < FERRUM_MAX_LINE - 1) {
 				ferrum_line[ferrum_pos++] = (char)b;
 			} else {
-				// Line too long — discard
 				ferrum_pos = 0;
 				proto_mode = PROTO_IDLE;
 			}
@@ -633,47 +610,41 @@ void kmbox_poll(void)
 
 }
 
-void kmbox_merge_report(uint8_t iface_protocol, uint8_t *report, uint8_t len)
+void kmbox_merge_report(uint8_t iface_protocol, uint8_t * restrict report, uint8_t len)
 {
 	if (iface_protocol == 2) {
-		// Cache actual report length for synthetic report construction
-		if (cached_mouse_report_len == 0)
+		if (__builtin_expect(cached_mouse_report_len == 0, 0))
 			cached_mouse_report_len = len;
 
-		if (inject.mouse_dirty && mouse_layout.valid) {
+		if (mouse_layout.valid &&
+		    (inject.mouse_dx || inject.mouse_dy ||
+		     inject.mouse_buttons || inject.mouse_wheel)) {
 			uint8_t doff = mouse_layout.data_off;
 
-			// Buttons: OR into first data byte (standard for all mice)
 			report[doff] |= inject.mouse_buttons;
 
-			// X: read current, add injection, clamp, write back
-			int32_t x_max = (1 << (mouse_layout.x_size - 1)) - 1;
 			int32_t rx = read_report_field(report, mouse_layout.x_bit,
 			                               mouse_layout.x_size, doff);
 			int32_t mx = rx + inject.mouse_dx;
-			if (mx > x_max) mx = x_max;
-			if (mx < -x_max) mx = -x_max;
+			if (mx > mouse_layout.x_max) mx = mouse_layout.x_max;
+			if (mx < -mouse_layout.x_max) mx = -mouse_layout.x_max;
 			write_report_field(report, mouse_layout.x_bit,
 			                   mouse_layout.x_size, doff, mx);
 
-			// Y: same pattern
-			int32_t y_max = (1 << (mouse_layout.y_size - 1)) - 1;
 			int32_t ry = read_report_field(report, mouse_layout.y_bit,
 			                               mouse_layout.y_size, doff);
 			int32_t my = ry + inject.mouse_dy;
-			if (my > y_max) my = y_max;
-			if (my < -y_max) my = -y_max;
+			if (my > mouse_layout.y_max) my = mouse_layout.y_max;
+			if (my < -mouse_layout.y_max) my = -mouse_layout.y_max;
 			write_report_field(report, mouse_layout.y_bit,
 			                   mouse_layout.y_size, doff, my);
 
-			// Wheel (if present and non-zero injection)
 			if (mouse_layout.wheel_bit != 0xFFFF && inject.mouse_wheel != 0) {
-				int32_t w_max = (1 << (mouse_layout.wheel_size - 1)) - 1;
 				int32_t rw = read_report_field(report, mouse_layout.wheel_bit,
 				                               mouse_layout.wheel_size, doff);
 				int32_t mw = rw + inject.mouse_wheel;
-				if (mw > w_max) mw = w_max;
-				if (mw < -w_max) mw = -w_max;
+				if (mw > mouse_layout.w_max) mw = mouse_layout.w_max;
+				if (mw < -mouse_layout.w_max) mw = -mouse_layout.w_max;
 				write_report_field(report, mouse_layout.wheel_bit,
 				                   mouse_layout.wheel_size, doff, mw);
 			}
@@ -682,10 +653,9 @@ void kmbox_merge_report(uint8_t iface_protocol, uint8_t *report, uint8_t len)
 			inject.mouse_dy = 0;
 			inject.mouse_wheel = 0;
 			inject.mouse_dirty = false;
-			merged_this_cycle = true;
 		}
+		merged_this_cycle = true;
 	} else if (iface_protocol == 1 && inject.kb_dirty) {
-		// Keyboard merge (8-byte boot report)
 		if (len >= 8) {
 			report[0] |= inject.kb_modifier;
 			for (int i = 0; i < 6; i++) {
@@ -714,24 +684,18 @@ void kmbox_merge_report(uint8_t iface_protocol, uint8_t *report, uint8_t len)
 void kmbox_send_pending(void)
 {
 	if (merged_this_cycle) return;
-
-	// Send synthetic mouse report if dirty (direct EP, no iface scan)
 	if (inject.mouse_dirty && cached_mouse_ep && mouse_layout.valid) {
 		uint8_t synth[16];
 		memset(synth, 0, sizeof(synth));
 		uint8_t doff = mouse_layout.data_off;
 		if (doff) synth[0] = mouse_layout.report_id;
 		synth[doff] = inject.mouse_buttons;
-
-		// Clamp to field range and write at correct bit positions
-		int32_t x_max = (1 << (mouse_layout.x_size - 1)) - 1;
-		int32_t y_max = (1 << (mouse_layout.y_size - 1)) - 1;
 		int32_t dx = inject.mouse_dx;
 		int32_t dy = inject.mouse_dy;
-		if (dx > x_max) dx = x_max;
-		if (dx < -x_max) dx = -x_max;
-		if (dy > y_max) dy = y_max;
-		if (dy < -y_max) dy = -y_max;
+		if (dx > mouse_layout.x_max) dx = mouse_layout.x_max;
+		if (dx < -mouse_layout.x_max) dx = -mouse_layout.x_max;
+		if (dy > mouse_layout.y_max) dy = mouse_layout.y_max;
+		if (dy < -mouse_layout.y_max) dy = -mouse_layout.y_max;
 
 		write_report_field(synth, mouse_layout.x_bit,
 		                   mouse_layout.x_size, doff, dx);
@@ -739,26 +703,20 @@ void kmbox_send_pending(void)
 		                   mouse_layout.y_size, doff, dy);
 
 		if (mouse_layout.wheel_bit != 0xFFFF && inject.mouse_wheel != 0) {
-			int32_t w_max = (1 << (mouse_layout.wheel_size - 1)) - 1;
 			int32_t w = inject.mouse_wheel;
-			if (w > w_max) w = w_max;
-			if (w < -w_max) w = -w_max;
+			if (w > mouse_layout.w_max) w = mouse_layout.w_max;
+			if (w < -mouse_layout.w_max) w = -mouse_layout.w_max;
 			write_report_field(synth, mouse_layout.wheel_bit,
 			                   mouse_layout.wheel_size, doff, w);
 		}
-
-		// Use actual report length seen from real device; fall back to maxpkt
 		uint8_t rlen = cached_mouse_report_len;
 		if (rlen == 0) rlen = (cached_mouse_maxpkt < 16) ? (uint8_t)cached_mouse_maxpkt : 16;
 		usb_device_send_report(cached_mouse_ep, synth, rlen);
-
 		inject.mouse_dx = 0;
 		inject.mouse_dy = 0;
 		inject.mouse_wheel = 0;
 		inject.mouse_dirty = false;
 	}
-
-	// Send synthetic keyboard report if dirty (direct EP, no iface scan)
 	if (inject.kb_dirty && cached_kb_ep) {
 		uint8_t synth[8];
 		synth[0] = inject.kb_modifier;
@@ -778,27 +736,22 @@ void kmbox_inject_smooth(int16_t dx, int16_t dy)
 uint32_t kmbox_frame_count(void) { return frames_ok; }
 uint32_t kmbox_error_count(void) { return frames_err; }
 uint32_t kmbox_rx_byte_count(void) { return rx_bytes_total; }
-
-// ---- Internal helpers ----
-
-// Apply a mouse command result to the inject state.
-// If use_smooth is true, movement goes through smooth queue.
 static void apply_mouse_result(int16_t dx, int16_t dy, uint8_t buttons,
                                int8_t wheel, bool use_smooth)
 {
 	inject.mouse_buttons = buttons;
 	inject.mouse_wheel += wheel;
-	inject.mouse_dirty = true;
 
 	if (use_smooth && (dx != 0 || dy != 0)) {
 		smooth_inject(dx, dy);
+		if (buttons != 0 || wheel != 0)
+			inject.mouse_dirty = true;
 	} else {
 		inject.mouse_dx += dx;
 		inject.mouse_dy += dy;
+		inject.mouse_dirty = true;
 	}
 }
-
-// ---- KMBox B frame dispatch ----
 static void dispatch_kmbox_frame(void)
 {
 	switch (frame_cmd) {
@@ -874,8 +827,6 @@ static void dispatch_kmbox_frame(void)
 		break;
 	}
 }
-
-// Enqueue a Makcu binary response: [0x50][cmd][len_lo][len_hi][payload...]
 static void makcu_send_response(uint8_t cmd, const uint8_t *payload, uint8_t plen)
 {
 	tx_enqueue(MAKCU_SYNC_BYTE);
@@ -885,8 +836,6 @@ static void makcu_send_response(uint8_t cmd, const uint8_t *payload, uint8_t ple
 	if (plen > 0)
 		tx_enqueue_buf(payload, plen);
 }
-
-// ---- Makcu frame dispatch ----
 static void dispatch_makcu_frame(void)
 {
 	makcu_result_t result;
@@ -902,7 +851,6 @@ static void dispatch_makcu_frame(void)
 			inject.kb_dirty = true;
 		}
 		if (result.click_release) {
-			// Schedule button release ~30ms after press
 			inject.click_release_mask = result.mouse_buttons;
 			inject.click_release_at = millis() + 30;
 		}
@@ -913,7 +861,6 @@ static void dispatch_makcu_frame(void)
 	}
 }
 
-// ---- Ferrum line dispatch ----
 static void dispatch_ferrum_line(void)
 {
 	ferrum_result_t result;
@@ -924,7 +871,6 @@ static void dispatch_ferrum_line(void)
 			                   true);
 		}
 		if (result.click_release) {
-			// Schedule button release ~30ms after click press
 			inject.click_release_mask = result.mouse_buttons;
 			inject.click_release_at = millis() + 30;
 		}

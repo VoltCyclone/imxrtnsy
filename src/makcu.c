@@ -129,14 +129,11 @@ bool makcu_parse_command(uint8_t cmd, const uint8_t *payload, uint16_t len,
 		set_ok_response(out, cmd);
 		return true;
 
-	// ---- Keyboard commands ----
-
 	case MAKCU_CMD_KB_DOWN:
 		// [key:u8]
 		if (len < 1) return false;
 		{
 			uint8_t key = payload[0];
-			// Add key to first empty slot
 			for (int i = 0; i < 6; i++) {
 				if (g_kb_keys[i] == key) break; // already pressed
 				if (g_kb_keys[i] == 0) {
@@ -170,8 +167,6 @@ bool makcu_parse_command(uint8_t cmd, const uint8_t *payload, uint16_t len,
 		return true;
 
 	case MAKCU_CMD_KB_PRESS:
-		// [key:u8, hold_ms:u16?, rand_ms:u16?]
-		// Press key — caller handles timed release
 		if (len < 1) return false;
 		{
 			uint8_t key = payload[0];
@@ -212,15 +207,11 @@ bool makcu_parse_command(uint8_t cmd, const uint8_t *payload, uint16_t len,
 		out->has_keyboard = true;
 		set_ok_response(out, cmd);
 		return true;
-
-	// ---- System commands ----
-
 	case MAKCU_CMD_VERSION:
 		// Getter: return version string
 		out->needs_response = true;
 		out->resp_cmd = cmd;
 		{
-			// "3.9" — matches Makcu firmware version
 			static const uint8_t ver[] = { '3', '.', '9' };
 			memcpy(out->resp_payload, ver, sizeof(ver));
 			out->resp_payload_len = sizeof(ver);
@@ -228,7 +219,6 @@ bool makcu_parse_command(uint8_t cmd, const uint8_t *payload, uint16_t len,
 		return true;
 
 	case MAKCU_CMD_INFO:
-		// Getter: return minimal device info
 		out->needs_response = true;
 		out->resp_cmd = cmd;
 		{
@@ -239,10 +229,7 @@ bool makcu_parse_command(uint8_t cmd, const uint8_t *payload, uint16_t len,
 		return true;
 
 	case MAKCU_CMD_BAUD:
-		// Getter (len==0) or setter (len==4)
-		// We acknowledge but don't change baud at runtime
 		if (len == 0) {
-			// Return current baud as u32 LE (115200 = 0x0001C200)
 			out->needs_response = true;
 			out->resp_cmd = cmd;
 			out->resp_payload[0] = 0x00;
@@ -256,12 +243,10 @@ bool makcu_parse_command(uint8_t cmd, const uint8_t *payload, uint16_t len,
 		return true;
 
 	case MAKCU_CMD_REBOOT:
-		// Acknowledge then let caller handle actual reboot if desired
 		set_ok_response(out, cmd);
 		return true;
 
 	case MAKCU_CMD_DEVICE:
-		// Return active device type — 0x01 = mouse+keyboard composite
 		out->needs_response = true;
 		out->resp_cmd = cmd;
 		out->resp_payload[0] = 0x01;
@@ -277,7 +262,6 @@ bool makcu_parse_command(uint8_t cmd, const uint8_t *payload, uint16_t len,
 	case MAKCU_CMD_SCREEN:
 	case MAKCU_CMD_SERIAL:
 	case MAKCU_CMD_FAULT:
-		// Acknowledge but no action needed
 		set_ok_response(out, cmd);
 		return true;
 
@@ -286,7 +270,6 @@ bool makcu_parse_command(uint8_t cmd, const uint8_t *payload, uint16_t len,
 	case MAKCU_CMD_KB_MASK:
 	case MAKCU_CMD_KB_REMAP:
 	case MAKCU_CMD_KB_STRING:
-		// Acknowledged but not fully implemented
 		set_ok_response(out, cmd);
 		return true;
 

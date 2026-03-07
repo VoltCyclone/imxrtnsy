@@ -20,8 +20,6 @@ static ehci_qtd_t  qtd_data   __attribute__((section(".dmabuffers"), aligned(32)
 static ehci_qtd_t  qtd_status __attribute__((section(".dmabuffers"), aligned(32)));
 static usb_setup_t setup_buf  __attribute__((section(".dmabuffers"), aligned(32)));
 static uint8_t     xfer_buf[2048] __attribute__((section(".dmabuffers"), aligned(32)));
-
-// Interrupt IN polling structures — one set per endpoint slot
 static ehci_qh_t   qh_intr[MAX_INTR_EPS]
 	__attribute__((section(".dmabuffers"), aligned(64)));
 static ehci_qtd_t  qtd_intr[MAX_INTR_EPS]
@@ -32,8 +30,6 @@ static bool        intr_initialized[MAX_INTR_EPS];
 static bool        intr_transfer_active[MAX_INTR_EPS];
 static uint32_t    intr_prime_time[MAX_INTR_EPS];
 static uint8_t     num_intr_eps = 0;
-
-// Periodic frame list (must be 4K aligned, 32 entries)
 static uint32_t periodic_list[32] __attribute__((section(".dmabuffers"), aligned(4096)));
 
 static uint8_t device_speed = USB_SPEED_FULL;
@@ -49,8 +45,6 @@ static void host_power_init(void)
 	IOMUXC_SW_MUX_CTL_PAD_GPIO_EMC_40 = 5; // ALT5 = GPIO8_IO26
 	IOMUXC_SW_PAD_CTL_PAD_GPIO_EMC_40 = 0x0008; // weak/slow drive per USBHost_t36
 	GPIO8_GDIR |= (1u << 26);
-
-	// Deterministic VBUS ON (no polarity guessing).
 	host_power_on();
 }
 
@@ -61,12 +55,8 @@ static void host_led_mark(uint8_t code)
 
 bool usb_host_init(void)
 {
-	// Use loop-based timeouts so early bring-up does not depend on SysTick.
-	// Values chosen to be generous at MCU clock rates.
 	const uint32_t timeout_loops = 4000000u;
 	host_led_mark(1);
-
-	// 1) USB2 PLL state machine (mirrors PJRC host sequence)
 	uint32_t timeout = timeout_loops;
 	while (1) {
 		uint32_t n = CCM_ANALOG_PLL_USB2;
@@ -82,7 +72,6 @@ bool usb_host_init(void)
 		} else if (!(n & CCM_ANALOG_PLL_USB2_POWER)) {
 			CCM_ANALOG_PLL_USB2_SET = CCM_ANALOG_PLL_USB2_POWER;
 		} else if (!(n & CCM_ANALOG_PLL_USB2_LOCK)) {
-			// wait for lock
 		} else if (n & CCM_ANALOG_PLL_USB2_BYPASS) {
 			CCM_ANALOG_PLL_USB2_CLR = CCM_ANALOG_PLL_USB2_BYPASS;
 		} else if (!(n & CCM_ANALOG_PLL_USB2_EN_USB_CLKS)) {
@@ -96,22 +85,14 @@ bool usb_host_init(void)
 			break;
 		}
 	}
-
-	// 2) Turn on USB controller clock gate
 	CCM_CCGR6 |= CCM_CCGR6_USBOH3(CCM_CCGR_ON);
 	host_led_mark(2);
-
-	// 3) Power up USB2 PHY
 	USBPHY2_CTRL_CLR = USBPHY_CTRL_SFTRST | USBPHY_CTRL_CLKGATE;
 	USBPHY2_CTRL_SET = USBPHY_CTRL_ENUTMILEVEL2 |
 		USBPHY_CTRL_ENUTMILEVEL3;
 	USBPHY2_PWD = 0; // Power up all PHY sections
-
-	// 4) Enable host VBUS switch (Teensy 4.1 specific)
 	host_power_init();
 	delay(25); // Allow VBUS to ramp and stabilize
-
-	// 5) Reset USB2 controller
 	USB2_USBCMD |= USB_USBCMD_RST;
 	timeout = timeout_loops;
 	while (USB2_USBCMD & USB_USBCMD_RST) {
@@ -121,17 +102,11 @@ bool usb_host_init(void)
 		}
 	}
 	host_led_mark(3);
-
-	// 6) Set host mode (match PJRC: only CM=host, no SDIS, no PTS)
 	USB2_USBMODE = USB_USBMODE_CM(3);
-
-	// 7) Initialize periodic schedule (all entries terminate)
 	for (int i = 0; i < 32; i++) {
 		periodic_list[i] = 1; // T-bit = 1, terminate
 	}
 	asm volatile("dsb" ::: "memory");
-
-	// 8) Set up async QH as the idle head
 	memset(&qh_async, 0, sizeof(qh_async));
 	qh_async.horizontal_link = (uint32_t)&qh_async | 0x02; // Type=QH, point to self
 	qh_async.capabilities[0] = (1 << 15); // Head of reclamation list (H-bit)
@@ -139,24 +114,15 @@ bool usb_host_init(void)
 	qh_async.alt_next = QTD_TERMINATE;
 	qh_async.token = 0;
 	asm volatile("dsb" ::: "memory");
-
-	// 9) Program EHCI registers
 	USB2_SBUSCFG = 1; // burst-aligned bus access (per PJRC)
 	USB2_USBINTR = 0; // No interrupts — we poll
 	USB2_PERIODICLISTBASE = (uint32_t)periodic_list;
 	USB2_FRINDEX = 0;
 	USB2_ASYNCLISTADDR = 0; // No async list yet (per PJRC; set when first transfer)
-
-	// Frame list size = 32 entries
-	// ITC(1) = low interrupt threshold for responsive polling
-	// ASP(3)/ASPE = async schedule park mode (per PJRC)
-	// NOTE: No ASE here — PJRC only enables ASE when a pipe is created.
 	USB2_USBCMD = USB_USBCMD_ITC(1) | USB_USBCMD_RS |
 		USB_USBCMD_ASP(3) | USB_USBCMD_ASPE |
 		USB_USBCMD_PSE |
 		USB_USBCMD_FS_2 | USB_USBCMD_FS_1(1);
-
-	// 10) Enable port power
 	USB2_PORTSC1 |= USB_PORTSC1_PP;
 	host_led_mark(4);
 
@@ -180,24 +146,15 @@ uint8_t usb_host_device_speed(void)
 
 void usb_host_port_reset(void)
 {
-	// PORTSC has W1C bits (CSC=1, PEC=3, OCC=5).  Mask them out in any
-	// read-modify-write so we don't accidentally clear status we haven't
-	// handled yet.
 	#define PORTSC_W1C_MASK  (USB_PORTSC1_CSC | (1u<<3) | (1u<<5))
 
 	uint32_t portsc = USB2_PORTSC1;
 	portsc &= ~PORTSC_W1C_MASK;  // Don't write-back W1C bits
-
-	// Assert port reset (also clear PE to avoid confusion)
 	USB2_PORTSC1 = (portsc & ~USB_PORTSC1_PE) | USB_PORTSC1_PR;
 	delay(50); // USB spec: hold reset for at least 50ms
-
-	// De-assert reset (read again, mask W1C, clear PR)
 	portsc = USB2_PORTSC1;
 	portsc &= ~PORTSC_W1C_MASK;
 	USB2_PORTSC1 = portsc & ~USB_PORTSC1_PR;
-
-	// Wait for reset to complete and port to become enabled
 	uint32_t timeout = millis() + 500;
 	while (!(USB2_PORTSC1 & USB_PORTSC1_PE)) {
 		if (millis() > timeout) {
@@ -205,17 +162,12 @@ void usb_host_port_reset(void)
 			return;
 		}
 	}
-
-	// Read speed: bits 27:26 of PORTSC
 	portsc = USB2_PORTSC1;
 	uint32_t pspd = (portsc >> 26) & 3;
 	if (pspd == 0) device_speed = USB_SPEED_FULL;
 	else if (pspd == 1) device_speed = USB_SPEED_LOW;
 	else if (pspd == 2) device_speed = USB_SPEED_HIGH;
-
-	// Clear connect status change
 	USB2_PORTSC1 |= USB_PORTSC1_CSC;
-
 	delay(10); // Recovery time after reset
 }
 
@@ -257,29 +209,19 @@ static void setup_qh_for_control(uint8_t addr, uint8_t maxpkt, uint8_t speed)
 // Returns 0 on success, -1 on error.
 static int execute_transfer(uint32_t timeout_ms)
 {
-	// Point EHCI at our QH and enable the async schedule
 	USB2_ASYNCLISTADDR = (uint32_t)&qh_async;
-
-	// Clear any stale USB status bits (W1C)
 	USB2_USBSTS = USB2_USBSTS;
 
 	if (!(USB2_USBCMD & USB_USBCMD_ASE)) {
 		USB2_USBCMD |= USB_USBCMD_ASE;
 	}
 
-	// Poll until the final (status) qTD completes.
-	// We check qtd_status.token directly because it starts with Active=1
-	// and is cleared by the controller on completion.  We also check the
-	// QH overlay for HALTED which is set if any earlier qTD hits an error.
 	uint32_t start = millis();
 	while (1) {
-		// Check QH overlay for halt (error in any qTD in the chain)
 		uint32_t qh_token = qh_async.token;
 		if (qh_token & QTD_TOKEN_HALTED) {
 			return -1;
 		}
-
-		// Check if the last qTD (status phase) has completed
 		uint32_t st_token = qtd_status.token;
 		if (!(st_token & QTD_TOKEN_ACTIVE)) {
 			if (st_token & (QTD_TOKEN_HALTED | QTD_TOKEN_BUFERR |
@@ -300,14 +242,8 @@ int usb_host_control_transfer(uint8_t addr, uint8_t maxpkt,
 {
 	uint16_t wLength = setup->wLength;
 	bool is_in = (setup->bmRequestType & 0x80) != 0;
-
-	// Copy setup packet to DMA buffer
 	memcpy(&setup_buf, setup, 8);
-
-	// Set up QH for this device
 	setup_qh_for_control(addr, maxpkt, device_speed);
-
-	// Build SETUP qTD
 	memset(&qtd_setup, 0, sizeof(qtd_setup));
 	qtd_setup.alt_next = QTD_TERMINATE;
 	qtd_setup.token = QTD_TOKEN_ACTIVE | QTD_TOKEN_PID_SETUP |
@@ -323,7 +259,6 @@ int usb_host_control_transfer(uint8_t addr, uint8_t maxpkt,
 	}
 
 	if (wLength > 0) {
-		// Build DATA qTD
 		memset(&qtd_data, 0, sizeof(qtd_data));
 		qtd_data.alt_next = QTD_TERMINATE;
 		qtd_data.token = QTD_TOKEN_ACTIVE | QTD_TOKEN_TOGGLE |
@@ -344,7 +279,6 @@ int usb_host_control_transfer(uint8_t addr, uint8_t maxpkt,
 			qtd_data.buffer[4] = addr + 0x4000;
 		}
 
-		// Build STATUS qTD (opposite direction of data)
 		memset(&qtd_status, 0, sizeof(qtd_status));
 		qtd_status.next = QTD_TERMINATE;
 		qtd_status.alt_next = QTD_TERMINATE;
@@ -352,37 +286,24 @@ int usb_host_control_transfer(uint8_t addr, uint8_t maxpkt,
 			QTD_TOKEN_NBYTES(0) | QTD_TOKEN_CERR(3) | QTD_TOKEN_IOC |
 			(is_in ? QTD_TOKEN_PID_OUT : QTD_TOKEN_PID_IN);
 
-		// Link: SETUP -> DATA -> STATUS
 		qtd_setup.next = (uint32_t)&qtd_data;
 		qtd_data.next = (uint32_t)&qtd_status;
 	} else {
-		// No data stage: STATUS qTD (always IN for no-data control transfers)
 		memset(&qtd_status, 0, sizeof(qtd_status));
 		qtd_status.next = QTD_TERMINATE;
 		qtd_status.alt_next = QTD_TERMINATE;
 		qtd_status.token = QTD_TOKEN_ACTIVE | QTD_TOKEN_TOGGLE |
 			QTD_TOKEN_NBYTES(0) | QTD_TOKEN_CERR(3) | QTD_TOKEN_IOC |
 			QTD_TOKEN_PID_IN;
-
-		// Link: SETUP -> STATUS
 		qtd_setup.next = (uint32_t)&qtd_status;
 	}
-
-	// Drain write buffer before linking to QH
 	asm volatile("dsb" ::: "memory");
-
-	// Link qTD chain to QH
 	qh_async.next = (uint32_t)&qtd_setup;
 	qh_async.token = 0; // Clear any previous status
 	asm volatile("dsb" ::: "memory");
-
-	// Execute and wait
 	int result = execute_transfer(2000);
 	if (result < 0) return -1;
-
-	// If IN transfer, copy received data back and return actual bytes
 	if (is_in && wLength > 0) {
-		// Calculate bytes actually transferred
 		uint32_t remaining = (qtd_data.token >> 16) & 0x7FFF;
 		uint32_t transferred = wLength - remaining;
 		memcpy(data, xfer_buf, transferred);
@@ -392,24 +313,10 @@ int usb_host_control_transfer(uint8_t addr, uint8_t maxpkt,
 	return 0;
 }
 
-// ---- Interrupt IN polling (periodic schedule) ----
-//
-// Interrupt endpoints belong in the EHCI periodic schedule, not the
-// async schedule.  The async ring is designed for control/bulk and uses
-// NAK counter / reclamation logic that can stall interrupt QHs.
-//
-// We link each interrupt QH into every slot of the 32-entry periodic
-// frame list so the controller polls them once per frame (1 ms at FS,
-// 125 µs at HS).
-
 static void link_periodic_schedule(void)
 {
-	// Build a chain: qh_intr[0] -> qh_intr[1] -> ... -> terminate
-	// Then point every periodic list entry at the head of that chain.
 	for (uint8_t i = 0; i < num_intr_eps; i++) {
 		if (!intr_initialized[i]) continue;
-
-		// Find next initialized QH in chain
 		uint32_t next_link = 0x01; // T-bit: terminate
 		for (uint8_t j = i + 1; j < num_intr_eps; j++) {
 			if (intr_initialized[j]) {
@@ -419,8 +326,6 @@ static void link_periodic_schedule(void)
 		}
 		qh_intr[i].horizontal_link = next_link;
 	}
-
-	// Find the first initialized QH
 	uint32_t head = 0x01; // T-bit if none
 	for (uint8_t i = 0; i < num_intr_eps; i++) {
 		if (intr_initialized[i]) {
@@ -429,7 +334,6 @@ static void link_periodic_schedule(void)
 		}
 	}
 
-	// Point every frame list entry at the head QH
 	for (int i = 0; i < 32; i++) {
 		periodic_list[i] = head;
 	}
@@ -448,29 +352,17 @@ void usb_host_interrupt_init(uint8_t index, uint8_t addr, uint8_t ep,
 
 	ehci_qh_t *qh = &qh_intr[index];
 	memset(qh, 0, sizeof(*qh));
-
-	// For the periodic schedule, S-mask (uFrame schedule mask) must be
-	// non-zero.  Bit 0 = micro-frame 0 of each frame.  For full-speed
-	// devices behind a high-speed hub, C-mask is also needed, but for
-	// devices directly on the root port we just need S-mask.
 	uint32_t cap0 = 0;
 	cap0 |= (0 << 28);               // NAK reload = 0 (not used for periodic)
 	cap0 |= ((uint32_t)maxpkt << 16);
-	// DTC=0: data toggle preserved in QH overlay (alternates correctly).
 	cap0 |= ((uint32_t)device_speed << 12);
 	cap0 |= ((uint32_t)(ep & 0x0F) << 8);
 	cap0 |= addr;
 	qh->capabilities[0] = cap0;
-
-	// capabilities[1]: Mult, S-mask, C-mask.
-	// S-mask = which micro-frames to schedule.
-	// C-mask = complete-split mask (required for FS/LS split transactions).
 	uint32_t cap1 = (1 << 30); // Mult = 1
 	if (device_speed == USB_SPEED_HIGH) {
-		// High-speed: poll every micro-frame, no split transactions
 		cap1 |= 0xFF;          // S-mask: all µFrames
 	} else {
-		// Full/Low-speed on root port: need split transactions
 		cap1 |= 0x01;          // S-mask: start-split in µFrame 0
 		cap1 |= (0x1C << 8);   // C-mask: complete-split in µFrames 2,3,4
 	}
@@ -504,14 +396,6 @@ int usb_host_interrupt_poll(uint8_t index, uint8_t *data, uint16_t len)
 	uint8_t   *buf = intr_buf[index];
 
 	if (!intr_transfer_active[index]) {
-		// Prime by writing the transfer directly into the QH overlay.
-		// This avoids a race condition: if we link a separate qTD via
-		// qh->next and set overlay Active=0, the controller must fetch
-		// the qTD before it can execute.  The main loop polls faster
-		// than the periodic schedule frame rate (1 ms), so the next
-		// poll reads overlay Active=0 and incorrectly treats it as a
-		// completed transfer.  Writing Active=1 directly into the
-		// overlay makes the transfer immediately visible to the EHCI.
 		uint32_t toggle = qh->token & QTD_TOKEN_TOGGLE;
 
 		qh->next     = QTD_TERMINATE;
@@ -534,7 +418,6 @@ int usb_host_interrupt_poll(uint8_t index, uint8_t *data, uint16_t len)
 		return 0;
 	}
 
-	// Check completion (non-blocking, single check)
 	uint32_t token = qh->token;
 
 	if (token & QTD_TOKEN_ACTIVE) {
@@ -553,7 +436,6 @@ int usb_host_interrupt_poll(uint8_t index, uint8_t *data, uint16_t len)
 
 	if (token & QTD_TOKEN_HALTED) {
 		intr_halt_count[index]++;
-		// Clear halt, preserve toggle, allow re-prime
 		qh->token = token & QTD_TOKEN_TOGGLE;
 		qh->next = QTD_TERMINATE;
 		asm volatile("dsb" ::: "memory");
@@ -567,8 +449,6 @@ int usb_host_interrupt_poll(uint8_t index, uint8_t *data, uint16_t len)
 		asm volatile("dsb" ::: "memory");
 		return -1;
 	}
-
-	// Success
 	uint32_t remaining = (token >> 16) & 0x7FFF;
 	uint32_t transferred = len - remaining;
 	if (transferred > 0) {

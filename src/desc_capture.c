@@ -1,8 +1,4 @@
 // USB descriptor capture — sequential blocking enumeration
-// Reads device, configuration, HID report, and string descriptors
-// from a device connected to the USB2 host port.
-// Supports composite devices with multiple HID interfaces.
-
 #include <string.h>
 #include "imxrt.h"
 #include "usb_host.h"
@@ -11,7 +7,6 @@
 
 extern void delay(uint32_t msec);
 
-// Build a setup packet for GET_DESCRIPTOR
 static usb_setup_t make_get_descriptor(uint8_t type, uint8_t index,
 	uint16_t langid, uint16_t length)
 {
@@ -24,7 +19,6 @@ static usb_setup_t make_get_descriptor(uint8_t type, uint8_t index,
 	return s;
 }
 
-// Build GET_DESCRIPTOR request for an interface-level request (e.g. HID report)
 static usb_setup_t make_get_iface_descriptor(uint8_t type, uint8_t index,
 	uint16_t iface, uint16_t length)
 {
@@ -37,7 +31,6 @@ static usb_setup_t make_get_iface_descriptor(uint8_t type, uint8_t index,
 	return s;
 }
 
-// Parse config descriptor to find all interfaces and their interrupt IN endpoints
 static bool parse_config_descriptor(captured_descriptors_t *desc)
 {
 	const uint8_t *p = desc->config_desc;
@@ -52,7 +45,6 @@ static bool parse_config_descriptor(captured_descriptors_t *desc)
 		if (dlen < 2 || p + dlen > end) break;
 
 		if (dtype == USB_DESC_INTERFACE && dlen >= 9) {
-			// Skip alternate settings
 			uint8_t alt_setting = p[3];
 			if (alt_setting != 0) {
 				cur_iface = NULL;
@@ -89,8 +81,6 @@ static bool parse_config_descriptor(captured_descriptors_t *desc)
 			uint8_t ep_attr = p[3];
 			uint16_t ep_maxpkt = p[4] | (p[5] << 8);
 			uint8_t ep_interval = p[6];
-
-			// Interrupt IN endpoint?
 			if ((ep_attr & 3) == 3 && (ep_addr & 0x80)) {
 				cur_iface->interrupt_ep       = ep_addr;
 				cur_iface->interrupt_maxpkt   = ep_maxpkt;
@@ -109,8 +99,6 @@ bool capture_descriptors(captured_descriptors_t *desc)
 	memset(desc, 0, sizeof(*desc));
 	int ret;
 	usb_setup_t setup;
-
-	// Step 1: Read first 8 bytes of device descriptor to get bMaxPacketSize0
 	setup = make_get_descriptor(USB_DESC_DEVICE, 0, 0, 8);
 	ret = usb_host_control_transfer(0, 8, &setup, desc->device_desc);
 	if (ret < 0 || ret < 8 || desc->device_desc[0] != 18 ||
@@ -119,8 +107,6 @@ bool capture_descriptors(captured_descriptors_t *desc)
 		return false;
 	}
 	desc->ep0_maxpkt = desc->device_desc[7]; // bMaxPacketSize0
-
-	// Step 2: SET_ADDRESS
 	desc->dev_addr = 1;
 	setup.bmRequestType = 0x00; // Host-to-Device, Standard, Device
 	setup.bRequest = USB_REQ_SET_ADDRESS;
@@ -133,8 +119,6 @@ bool capture_descriptors(captured_descriptors_t *desc)
 		return false;
 	}
 	delay(10); // Device needs time to process new address
-
-	// Step 3: Read full device descriptor
 	setup = make_get_descriptor(USB_DESC_DEVICE, 0, 0, 18);
 	ret = usb_host_control_transfer(desc->dev_addr, desc->ep0_maxpkt,
 		&setup, desc->device_desc);
@@ -144,8 +128,6 @@ bool capture_descriptors(captured_descriptors_t *desc)
 		return false;
 	}
 	desc->device_desc_len = 18;
-
-	// Step 4: Read config descriptor header (9 bytes) to get wTotalLength
 	setup = make_get_descriptor(USB_DESC_CONFIGURATION, 0, 0, 9);
 	ret = usb_host_control_transfer(desc->dev_addr, desc->ep0_maxpkt,
 		&setup, desc->config_desc);
@@ -161,8 +143,6 @@ bool capture_descriptors(captured_descriptors_t *desc)
 		uart_puts("\r\n");
 		total_len = MAX_CONFIG_DESC_SIZE;
 	}
-
-	// Step 5: Read full config descriptor
 	setup = make_get_descriptor(USB_DESC_CONFIGURATION, 0, 0, total_len);
 	ret = usb_host_control_transfer(desc->dev_addr, desc->ep0_maxpkt,
 		&setup, desc->config_desc);
@@ -171,11 +151,7 @@ bool capture_descriptors(captured_descriptors_t *desc)
 		return false;
 	}
 	desc->config_desc_len = (uint16_t)ret;
-
-	// Step 6: Parse config to find all interfaces and endpoints
 	parse_config_descriptor(desc);
-
-	// Step 7: Read HID report descriptors for each HID interface
 	for (uint8_t i = 0; i < desc->num_ifaces; i++) {
 		captured_iface_t *iface = &desc->ifaces[i];
 		if (iface->iface_class != 3) continue;
@@ -197,8 +173,6 @@ bool capture_descriptors(captured_descriptors_t *desc)
 		}
 	}
 
-	// Step 8: Read string descriptors
-	// First get language ID
 	uint8_t str_buf[MAX_STRING_DESC_SIZE];
 	setup = make_get_descriptor(USB_DESC_STRING, 0, 0, 4);
 	ret = usb_host_control_transfer(desc->dev_addr, desc->ep0_maxpkt,
@@ -207,7 +181,6 @@ bool capture_descriptors(captured_descriptors_t *desc)
 	if (ret >= 4 && str_buf[1] == USB_DESC_STRING) {
 		langid = str_buf[2] | (str_buf[3] << 8);
 	}
-	// Read manufacturer, product, serial strings
 	uint8_t string_indices[3] = {
 		desc->device_desc[14], // iManufacturer
 		desc->device_desc[15], // iProduct

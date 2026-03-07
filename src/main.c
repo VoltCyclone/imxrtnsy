@@ -15,6 +15,9 @@
 #if TFT_ENABLED
 #include "tft_display.h"
 #endif
+#if TOUCH_ENABLED
+#include "ft6206.h"
+#endif
 
 extern uint32_t millis(void);
 extern void delay(uint32_t msec);
@@ -104,11 +107,10 @@ static void tempmon_init(void)
 	CCM_CCGR2 |= CCM_CCGR2_OCOTP_CTRL(CCM_CCGR_ON);
 
 	// Read factory calibration from ANA1 fuse:
-	// bits [31:20] = hot_count, bits [19:8] = hot_temp, bits [7:0] = room_count_offset
+	// bits [31:20] = hot_count (12-bit), bits [19:12] = hot_temp (8-bit)
 	uint32_t ana1 = HW_OCOTP_ANA1;
 	hot_count  = (ana1 >> 20) & 0xFFF;
-	hot_temp   = (int32_t)((ana1 >> 8) & 0xFFF);
-	room_count = ana1 & 0xFF;
+	hot_temp   = (int32_t)((ana1 >> 12) & 0xFF);
 	// room_count is stored as offset from hot_count in some revisions;
 	// ANA2 has the actual room count on IMXRT1062
 	uint32_t ana2 = HW_OCOTP_ANA2;
@@ -309,46 +311,37 @@ int main(void)
 		// Clamp to [125µs, 10ms] — sane range for smooth injection
 		if (interval_us < 125) interval_us = 125;
 		if (interval_us > 10000) interval_us = 10000;
-		uint32_t ldval = (150u * interval_us) - 1; // IPG = 150 MHz
+		uint32_t ipg_mhz = (F_CPU / 4u) / 1000000u; // IPG = ARM / 4
+		uint32_t ldval = (ipg_mhz * interval_us) - 1;
 		PIT_LDVAL0 = ldval;
 		PIT_TCTRL0 = PIT_TCTRL_TIE | PIT_TCTRL_TEN;
+		smooth_init(interval_us);
 	}
-
-	// Cache mouse/keyboard EP numbers for fast injection dispatch
 	kmbox_cache_endpoints(&desc);
-
-	// Initialize USB1 device stack
 	if (!usb_device_init(&desc)) {
 		led_blink_forever(9, 80, 120);
 	}
-
-	// Wait for host PC to enumerate us — must call usb_device_poll()
-	// continuously so SETUP packets are answered within the USB spec
-	// timeout.  Blocking LED patterns here cause multi-minute enumeration.
 	led_off();
 	uint32_t dev_wait_start = millis();
 	uint32_t dev_led_toggle = millis();
 	while (!usb_device_is_configured()) {
 		usb_device_poll();
-		// Non-blocking LED toggle every 250 ms
 		if ((millis() - dev_led_toggle) >= 250) {
 			led_toggle();
 			dev_led_toggle = millis();
 		}
 
 		if ((millis() - dev_wait_start) > 30000) {
-			// USB1 device side not being configured by PC host
 			led_blink_forever(8, 80, 120);
 		}
 	}
 	led_off();
-
-	// ---- TFT display init (after USB enumeration, before main loop) ----
 #if TFT_ENABLED
 	tft_display_init();
 #endif
-
-	// Hardware NAK rate-limits polling (1 frame = 1ms full-speed, 125us high-speed).
+#if TOUCH_ENABLED
+	ft6206_init();
+#endif
 	uart_puts("\r\n=== PROXY ACTIVE (");
 	uart_putdec(num_ep_mappings);
 	uart_puts(" endpoints) ===\r\n");
@@ -370,8 +363,6 @@ int main(void)
 	while (1) {
 		usb_device_poll();
 		kmbox_poll();
-
-		// Process smooth queue at PIT-driven 1kHz rate
 		if (pit_tick_pending) {
 			pit_tick_pending = false;
 			int16_t sx, sy;
@@ -392,26 +383,18 @@ int main(void)
 				} else {
 					drop_count++;
 				}
-
-				// Non-blocking LED pulse on forwarded report
 				led_on();
 				led_off_time = millis() + 2;
 			}
 		}
-
-		// Turn off LED after pulse expires
 		if (led_off_time && millis() >= led_off_time) {
 			led_off();
 			led_off_time = 0;
 		}
-
-		// Send injected-only reports if no real report was merged this cycle
 		kmbox_send_pending();
 
 #if TFT_ENABLED
-		// TFT display update at ~30 Hz (33ms intervals)
 		if ((millis() - last_tft_update) >= 33) {
-			// Compute report rate over the interval
 			uint32_t now = millis();
 			uint32_t dt = now - prev_report_time;
 			if (dt > 0)
@@ -444,10 +427,18 @@ int main(void)
 			__builtin_memcpy(st.usb_product, usb_product, sizeof(usb_product));
 			tft_display_update(&st);
 			last_tft_update = now;
+
+#if TOUCH_ENABLED
+			touch_point_t tp;
+			if (ft6206_poll(&tp) && tp.valid) {
+				if (tft_display_touch(tp.x, tp.y)) {
+					const tft_settings_t *cfg = tft_display_get_settings();
+					smooth_set_max_per_frame(cfg->smooth_max);
+				}
+			}
+#endif
 		}
 #endif
-
-		// Disconnect check
 		if ((++loop_count & 0x3FF) == 0) {
 			if (!usb_host_device_connected()) {
 				uart_puts("Mouse disconnected!\r\n");

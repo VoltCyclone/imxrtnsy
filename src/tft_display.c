@@ -1,12 +1,12 @@
-// tft_display.c — Stats rendering for USB proxy TFT display
-// Renders proxy metrics onto ST7735 128x160 framebuffer
-// Layout: 21 chars x 20 lines (6x8 font)
+// tft_display.c — Stats + settings rendering for USB proxy TFT display
+// Supports ST7735 (21×20 grid) and ILI9341 (40×40 grid) via TFT_DRIVER
+// Touch-driven settings menu on ILI9341 when TOUCH_ENABLED
 
 #include "tft_display.h"
 #include "tft.h"
 #include <string.h>
 
-// ---- Formatting helpers (no snprintf, no libc) ----
+// ---- Formatting helpers ----
 
 static char *u32_to_str(char *buf, uint32_t v)
 {
@@ -61,7 +61,16 @@ static void draw_separator(int y)
 	tft_draw_hline(2, TFT_WIDTH - 3, y + FH / 2, COL_DIM);
 }
 
-// ---- Stats rendering ----
+// ---- View/settings state ----
+static tft_view_t     g_view = TFT_VIEW_STATS;
+static tft_settings_t g_settings = {
+	.smooth_enabled   = true,
+	.smooth_max       = 127,
+	.humanize_enabled = true,
+	.backlight        = true,
+};
+static uint8_t g_selected_setting = 0;
+
 static void draw_stats(const tft_proxy_stats_t *s)
 {
 	char buf[24];
@@ -69,13 +78,11 @@ static void draw_stats(const tft_proxy_stats_t *s)
 
 	tft_fill(COL_BG);
 
-	// Line 0: Title
-	tft_draw_string(COL(7), LINE(0), COL_CYAN, "IMXRTNSY");
+	int title_col = (TFT_COLS - 8) / 2;
+	tft_draw_string(COL(title_col), LINE(0), COL_CYAN, "IMXRTNSY");
 
-	// Line 1: separator
 	draw_separator(LINE(1));
 
-	// Line 2: Host + Device status
 	tft_draw_string(COL(0), LINE(2), COL_GRAY, "Host:");
 	tft_draw_string(COL(5), LINE(2),
 		s->host_connected ? COL_GREEN : COL_RED,
@@ -85,7 +92,6 @@ static void draw_stats(const tft_proxy_stats_t *s)
 		s->device_configured ? COL_GREEN : COL_RED,
 		s->device_configured ? "OK" : "--");
 
-	// Line 3: Protocol + endpoints
 	{
 		const char *proto[] = { "None", "KMBox", "Makcu", "Ferrum" };
 		uint8_t pm = s->protocol_mode;
@@ -96,7 +102,6 @@ static void draw_stats(const tft_proxy_stats_t *s)
 			proto[pm]);
 	}
 
-	// Line 4: Speed + EPs
 	{
 		const char *spd[] = { "Full", "Low", "High" };
 		uint8_t sp = s->device_speed;
@@ -110,17 +115,14 @@ static void draw_stats(const tft_proxy_stats_t *s)
 		tft_draw_string(COL(16), LINE(4), COL_WHITE, buf);
 	}
 
-	// Line 5: separator
 	draw_separator(LINE(5));
 
-	// Line 6: Report count
 	tft_draw_string(COL(0), LINE(6), COL_GRAY, "Reports:");
 	p = buf;
 	p = u32_to_str(p, s->report_count);
 	fmt_done(buf, p);
 	tft_draw_string(COL(9), LINE(6), COL_WHITE, buf);
 
-	// Line 7: Rate
 	tft_draw_string(COL(0), LINE(7), COL_GRAY, "Rate:");
 	p = buf;
 	p = u32_to_str(p, s->reports_per_sec);
@@ -128,7 +130,6 @@ static void draw_stats(const tft_proxy_stats_t *s)
 	fmt_done(buf, p);
 	tft_draw_string(COL(5), LINE(7), COL_GREEN, buf);
 
-	// Line 8: Drops
 	tft_draw_string(COL(0), LINE(8), COL_GRAY, "Drops:");
 	p = buf;
 	p = u32_to_str(p, s->drop_count);
@@ -136,7 +137,6 @@ static void draw_stats(const tft_proxy_stats_t *s)
 	tft_draw_string(COL(6), LINE(8),
 		s->drop_count > 0 ? COL_RED : COL_DARK, buf);
 
-	// Line 9: KMBox frames
 	tft_draw_string(COL(0), LINE(9), COL_GRAY, "KMBox:");
 	p = buf;
 	p = u32_to_str(p, s->kmbox_frames_ok);
@@ -152,7 +152,6 @@ static void draw_stats(const tft_proxy_stats_t *s)
 		tft_draw_string(COL(16), LINE(9), COL_RED, buf);
 	}
 
-	// Line 10: separator
 	draw_separator(LINE(10));
 
 	// Line 11: Smooth injection
@@ -173,7 +172,6 @@ static void draw_stats(const tft_proxy_stats_t *s)
 		tft_draw_string(COL(7), LINE(11), COL_DARK, "idle");
 	}
 
-	// Line 12: separator
 	draw_separator(LINE(12));
 
 	// Line 13: UART RX activity
@@ -188,10 +186,8 @@ static void draw_stats(const tft_proxy_stats_t *s)
 		tft_draw_string(COL(9), LINE(13), COL_RED, "no data");
 	}
 
-	// Line 14: separator
 	draw_separator(LINE(14));
 
-	// Line 15: Uptime + CPU temp
 	{
 		uint32_t sec = s->uptime_sec;
 		uint32_t hr  = sec / 3600;
@@ -217,10 +213,8 @@ static void draw_stats(const tft_proxy_stats_t *s)
 		tft_draw_string(COL(18), LINE(15), tcol, buf);
 	}
 
-	// Line 16: separator
 	draw_separator(LINE(16));
 
-	// Line 17: VID:PID
 	{
 		tft_draw_string(COL(0), LINE(17), COL_GRAY, "USB:");
 		p = buf;
@@ -231,38 +225,219 @@ static void draw_stats(const tft_proxy_stats_t *s)
 		tft_draw_string(COL(4), LINE(17), COL_WHITE, buf);
 	}
 
-	// Line 18-19: Product name
 	if (s->usb_product[0]) {
 		tft_draw_string(COL(0), LINE(18), COL_DARK, s->usb_product);
 	}
+
+#if TFT_DRIVER == TFT_DRIVER_ILI9341
+	// Bottom touch zone indicator (line 39)
+	draw_separator(LINE(37));
+	int settings_col = (TFT_COLS - 14) / 2;
+	tft_draw_string(COL(settings_col), LINE(38), COL_DIM, "Tap for Setup");
+#endif
 }
 
-// ---- Public API ----
+#if TFT_DRIVER == TFT_DRIVER_ILI9341
+
+typedef struct {
+	const char *label;
+	bool        is_bool;
+} setting_info_t;
+
+static const setting_info_t setting_info[SETTING_COUNT] = {
+	{ "Smooth",    true  },
+	{ "Max/Frame", false },
+	{ "Humanize",  true  },
+	{ "Backlight", true  },
+};
+
+#define MENU_START_Y   3  // first setting starts at line 3
+#define MENU_ITEM_H    4  // lines per menu item
+#define MENU_BACK_Y    (MENU_START_Y + SETTING_COUNT * MENU_ITEM_H + 1)
+
+static void draw_settings(void)
+{
+	char buf[24];
+	char *p;
+
+	tft_fill(COL_BG);
+
+	// Title
+	int title_col = (TFT_COLS - 8) / 2;
+	tft_draw_string(COL(title_col), LINE(0), COL_CYAN, "SETTINGS");
+	draw_separator(LINE(1));
+
+	for (uint8_t i = 0; i < SETTING_COUNT; i++) {
+		int y = LINE(MENU_START_Y + i * MENU_ITEM_H);
+		uint8_t label_col = (i == g_selected_setting) ? COL_YELLOW : COL_GRAY;
+
+		if (i == g_selected_setting) {
+			tft_draw_glyph(COL(0), y, COL_YELLOW, '>');
+		}
+
+		tft_draw_string(COL(2), y, label_col, setting_info[i].label);
+
+		const char *val_str = NULL;
+		uint8_t val_col = COL_WHITE;
+		switch ((setting_id_t)i) {
+		case SETTING_SMOOTH_ENABLED:
+			val_str = g_settings.smooth_enabled ? "ON" : "OFF";
+			val_col = g_settings.smooth_enabled ? COL_GREEN : COL_RED;
+			break;
+		case SETTING_SMOOTH_MAX:
+			p = buf;
+			p = u32_to_str(p, (uint32_t)g_settings.smooth_max);
+			fmt_done(buf, p);
+			val_str = buf;
+			break;
+		case SETTING_HUMANIZE_ENABLED:
+			val_str = g_settings.humanize_enabled ? "ON" : "OFF";
+			val_col = g_settings.humanize_enabled ? COL_GREEN : COL_RED;
+			break;
+		case SETTING_BACKLIGHT:
+			val_str = g_settings.backlight ? "ON" : "OFF";
+			val_col = g_settings.backlight ? COL_GREEN : COL_RED;
+			break;
+		default:
+			break;
+		}
+		if (val_str) {
+			tft_draw_string_right(TFT_WIDTH - COL(2), y, val_col, val_str);
+		}
+
+		if (i == g_selected_setting) {
+			int hint_y = y + FH;
+			if (setting_info[i].is_bool) {
+				int hint_col = (TFT_COLS - 12) / 2;
+				tft_draw_string(COL(hint_col), hint_y, COL_DIM, "Tap to toggle");
+			} else {
+				tft_draw_string(COL(2), hint_y, COL_DIM, "[-]");
+				tft_draw_string_right(TFT_WIDTH - COL(2), hint_y, COL_DIM, "[+]");
+			}
+		}
+
+		draw_separator(LINE(MENU_START_Y + i * MENU_ITEM_H + MENU_ITEM_H - 1));
+	}
+
+	int back_col = (TFT_COLS - 4) / 2;
+	tft_draw_string(COL(back_col), LINE(MENU_BACK_Y), COL_CYAN, "Back");
+}
+#endif // TFT_DRIVER == TFT_DRIVER_ILI9341
+
+// ---- Touch handling ----
+
+bool tft_display_touch(uint16_t x, uint16_t y)
+{
+#if TFT_DRIVER == TFT_DRIVER_ILI9341
+	if (g_view == TFT_VIEW_STATS) {
+		// Tap bottom zone to enter settings
+		if (y >= (uint16_t)LINE(37)) {
+			g_view = TFT_VIEW_SETTINGS;
+			return false;
+		}
+		return false;
+	}
+
+	// Settings view
+	// Check "Back" button
+	int back_y = LINE(MENU_BACK_Y);
+	if (y >= (uint16_t)back_y && y < (uint16_t)(back_y + FH * 2)) {
+		g_view = TFT_VIEW_STATS;
+		return false;
+	}
+
+	// Check which setting was tapped
+	for (uint8_t i = 0; i < SETTING_COUNT; i++) {
+		int item_y = LINE(MENU_START_Y + i * MENU_ITEM_H);
+		int item_end = item_y + FH * MENU_ITEM_H;
+		if (y >= (uint16_t)item_y && y < (uint16_t)item_end) {
+			if (i != g_selected_setting) {
+				g_selected_setting = i;
+				return false; // just select, don't change value yet
+			}
+			// Already selected — modify value
+			bool left_half = (x < TFT_WIDTH / 2);
+			switch ((setting_id_t)i) {
+			case SETTING_SMOOTH_ENABLED:
+				g_settings.smooth_enabled = !g_settings.smooth_enabled;
+				return true;
+			case SETTING_SMOOTH_MAX:
+				if (left_half) {
+					g_settings.smooth_max -= 10;
+					if (g_settings.smooth_max < 1) g_settings.smooth_max = 1;
+				} else {
+					g_settings.smooth_max += 10;
+					if (g_settings.smooth_max > 127) g_settings.smooth_max = 127;
+				}
+				return true;
+			case SETTING_HUMANIZE_ENABLED:
+				g_settings.humanize_enabled = !g_settings.humanize_enabled;
+				return true;
+			case SETTING_BACKLIGHT:
+				g_settings.backlight = !g_settings.backlight;
+				return true;
+			default:
+				break;
+			}
+		}
+	}
+#else
+	(void)x; (void)y;
+#endif
+	return false;
+}
+
+tft_view_t tft_display_get_view(void)
+{
+	return g_view;
+}
+
+const tft_settings_t *tft_display_get_settings(void)
+{
+	return &g_settings;
+}
+
 
 void tft_display_init(void)
 {
 	tft_init();
 
-	// Splash screen
 	tft_fill(COL_BG);
-	tft_draw_string(COL(7), LINE(8), COL_CYAN, "IMXRTNSY");
-	tft_draw_string(COL(4), LINE(10), COL_GRAY, "USB HID Proxy");
-	tft_draw_string(COL(6), LINE(12), COL_DARK, "ST7735 TFT");
+	int title_col = (TFT_COLS - 8) / 2;
+	tft_draw_string(COL(title_col), LINE(TFT_ROWS / 2 - 2), COL_CYAN, "IMXRTNSY");
+	int sub_col = (TFT_COLS - 13) / 2;
+	tft_draw_string(COL(sub_col), LINE(TFT_ROWS / 2), COL_GRAY, "USB HID Proxy");
+#if TFT_DRIVER == TFT_DRIVER_ILI9341
+	int drv_col = (TFT_COLS - 11) / 2;
+	tft_draw_string(COL(drv_col), LINE(TFT_ROWS / 2 + 2), COL_DARK, "ILI9341 TFT");
+#else
+	int drv_col = (TFT_COLS - 10) / 2;
+	tft_draw_string(COL(drv_col), LINE(TFT_ROWS / 2 + 2), COL_DARK, "ST7735 TFT");
+#endif
 	tft_swap_sync();
 }
 
 void tft_display_update(const tft_proxy_stats_t *stats)
 {
+#if TFT_DRIVER == TFT_DRIVER_ILI9341
+	if (g_view == TFT_VIEW_SETTINGS) {
+		draw_settings();
+	} else {
+		draw_stats(stats);
+	}
+#else
 	draw_stats(stats);
+#endif
 	tft_swap_sync();
 }
 
 void tft_display_error(const char *msg)
 {
 	tft_fill(COL_BG);
-	tft_draw_string(COL(8), LINE(8), COL_RED, "ERROR");
+	int err_col = (TFT_COLS - 5) / 2;
+	tft_draw_string(COL(err_col), LINE(TFT_ROWS / 2 - 2), COL_RED, "ERROR");
 
-	int y = LINE(10);
+	int y = LINE(TFT_ROWS / 2);
 	int max_chars = TFT_WIDTH / FW;
 	while (*msg && y < TFT_HEIGHT - FH) {
 		int len = 0;

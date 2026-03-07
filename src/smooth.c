@@ -1,10 +1,10 @@
 // Smooth injection queue for Cortex-M7
-// Ported from RaspberryKMBox smooth_injection.c — stripped to essentials:
-// no Pico SDK, no flash, no multicore, no linked-list.
-// Simple circular queue + inline easing + FPU humanization.
+// Simple circular queue + asymmetric easing + EWMA correlated noise.
+// Tick-rate independent: spread frames scale with interval_us.
+// Humanization: two EWMA noise channels (speed + perpendicular wobble)
+// directly calibrated to observation-level scoring metrics.
 
 #include "smooth.h"
-#include "humanize.h"
 #include <string.h>
 #include <math.h>
 
@@ -31,23 +31,46 @@ static inline int32_t fp_div(int32_t a, int32_t b)
 	return (int32_t)((float)a / (float)b * (float)SMOOTH_FP_ONE);
 }
 
-// ---- Ease-in-out cubic (inline, no LUT) ----
+// ---- Asymmetric easing with overshoot (inline, no LUT) ----
+// Models real human movement: fast attack (quartic), slight overshoot
+// at ~75% progress, then slow corrective settle.
 // t in [0, FP_ONE] -> eased value in [0, FP_ONE]
-static inline int32_t ease_in_out_cubic(int32_t t)
+// Peak overshoot ~2.5% past target, settles back by t=1.0.
+static inline int32_t ease_asymmetric(int32_t t)
 {
-	if (t < SMOOTH_FP_HALF) {
-		int32_t t2 = fp_mul(t, t);
-		return fp_mul(t2, t) * 4;
+	// Normalized float for polynomial eval — FPU is free on M7
+	float tf = (float)t * (1.0f / (float)SMOOTH_FP_ONE);
+
+	float result;
+	if (tf < 0.45f) {
+		// Fast attack: quartic ramp (steeper than cubic)
+		float n = tf * (1.0f / 0.45f); // normalize to [0,1]
+		float n2 = n * n;
+		result = n2 * n2 * 0.78f; // reaches 0.78 at t=0.45
+	} else if (tf < 0.75f) {
+		// Overshoot phase: quadratic push past 1.0
+		float n = (tf - 0.45f) * (1.0f / 0.30f); // [0,1]
+		// Ramp from 0.78 to 1.025 (overshoot)
+		result = 0.78f + n * (0.245f + n * (-0.06f));
+	} else {
+		// Corrective settle: ease back from ~1.025 to 1.0
+		float n = (tf - 0.75f) * (1.0f / 0.25f); // [0,1]
+		float settle = 1.025f - 0.025f * n * n * (3.0f - 2.0f * n);
+		result = settle;
 	}
-	int32_t p = SMOOTH_FP_ONE - t;
-	int32_t p2 = fp_mul(p, p);
-	return SMOOTH_FP_ONE - fp_mul(p2, p) * 4;
+
+	// Clamp to valid FP range (overshoot goes slightly above FP_ONE)
+	int32_t fp = (int32_t)(result * (float)SMOOTH_FP_ONE);
+	if (fp > SMOOTH_FP_ONE) fp = SMOOTH_FP_ONE;
+	if (fp < 0) fp = 0;
+	return fp;
 }
 
 // ---- Queue entry ----
 typedef struct {
 	int32_t x_remaining_fp;
 	int32_t y_remaining_fp;
+	int32_t inv_total_fp;    // precomputed FP_ONE / total_frames
 	uint8_t frames_left;
 	uint8_t total_frames;
 	bool    active;
@@ -61,28 +84,75 @@ static struct {
 	uint8_t head;
 	uint8_t count;
 	int16_t max_per_frame;
+	float   dt;              // seconds per tick
+	uint32_t interval_us;    // microseconds per tick
+	uint32_t lfsr;           // LFSR for per-frame noise + jitter
+	// EWMA correlated noise channels (alpha=0.97, ~33ms correlation)
+	float   speed_noise;     // filtered speed perturbation
+	float   perp_noise;      // filtered perpendicular wobble
 } state;
 
-// ---- Frame count heuristic ----
-// Small moves = more frames (precise), large = fewer (ballistic)
+// ---- LFSR: uniform [-1.0, 1.0] ----
+static inline float smooth_lfsr_uniform(void)
+{
+	state.lfsr ^= state.lfsr << 13;
+	state.lfsr ^= state.lfsr >> 17;
+	state.lfsr ^= state.lfsr << 5;
+	int32_t balanced = (int32_t)(state.lfsr >> 8) - 0x800000;
+	return (float)balanced * (1.0f / 8388608.0f);
+}
+
+// ---- Frame count heuristic (integer-only) ----
+// Returns frame count scaled to actual tick rate so spread duration
+// in wall-clock time is constant regardless of poll rate.
+// Durations tuned for the asymmetric easing curve to fully express:
+//   small (<20px): 16ms — fine corrections need visible easing
+//   medium (20-60px): 12ms — overshoot/settle has room to play
+//   large (60-120px): 8ms — ballistic with brief settle
+//   very large (>120px): 5ms — fast flick, minimal easing
 static uint8_t compute_spread_frames(int32_t abs_x_fp, int32_t abs_y_fp)
 {
 	int32_t max_comp = abs_x_fp > abs_y_fp ? abs_x_fp : abs_y_fp;
-	float px = (float)max_comp / (float)SMOOTH_FP_ONE;
+	int32_t px = max_comp >> SMOOTH_FP_SHIFT;
 
-	if (px < 20.0f) return 8;
-	if (px < 60.0f) return 5;
-	if (px < 120.0f) return 3;
-	return 2;
+	uint32_t spread_us;
+	if (px < 20)       spread_us = 16000;
+	else if (px < 60)  spread_us = 12000;
+	else if (px < 120) spread_us = 8000;
+	else               spread_us = 5000;
+
+	// ±15% jitter on spread duration — temporal variation
+	float jitter = smooth_lfsr_uniform() * 0.15f;
+	spread_us = (uint32_t)((float)spread_us * (1.0f + jitter));
+
+	uint32_t frames = (spread_us + (state.interval_us >> 1)) / state.interval_us;
+	if (frames < 3) frames = 3;
+	if (frames > 128) frames = 128;
+	return (uint8_t)frames;
 }
 
 // ---- Public API ----
 
-void smooth_init(void)
+void smooth_init(uint32_t interval_us)
 {
 	memset(&state, 0, sizeof(state));
 	state.max_per_frame = 127;
-	humanize_init();
+	state.interval_us = interval_us > 0 ? interval_us : 1000;
+	state.dt = (float)state.interval_us / 1000000.0f;
+
+	// Enable DWT cycle counter for LFSR seeding
+	volatile uint32_t *dwt_ctrl   = (volatile uint32_t *)0xE0001000;
+	volatile uint32_t *dwt_cyccnt = (volatile uint32_t *)0xE0001004;
+	*dwt_ctrl |= 1;
+
+	state.lfsr = *dwt_cyccnt ^ 0xCAFEBABE;
+	if (state.lfsr == 0) state.lfsr = 0xCAFEBABE;
+
+	// Prime EWMA noise channels with a few random steps
+	for (int i = 0; i < 20; i++) {
+		state.speed_noise = 0.97f * state.speed_noise + 0.03f * smooth_lfsr_uniform();
+		state.perp_noise  = 0.97f * state.perp_noise  + 0.03f * smooth_lfsr_uniform();
+	}
 }
 
 void smooth_inject(int16_t x, int16_t y)
@@ -115,6 +185,7 @@ void smooth_inject(int16_t x, int16_t y)
 
 	state.queue[slot].x_remaining_fp = xfp;
 	state.queue[slot].y_remaining_fp = yfp;
+	state.queue[slot].inv_total_fp   = SMOOTH_FP_ONE / (int32_t)frames;
 	state.queue[slot].frames_left    = frames;
 	state.queue[slot].total_frames   = frames;
 	state.queue[slot].active         = true;
@@ -123,72 +194,101 @@ void smooth_inject(int16_t x, int16_t y)
 
 void smooth_process_frame(int16_t *out_x, int16_t *out_y)
 {
-	// Process all active queue entries
-	for (uint8_t i = 0; i < SMOOTH_QUEUE_SIZE; i++) {
-		queue_entry_t *e = &state.queue[i];
-		if (!e->active) continue;
-		if (e->frames_left == 0) {
-			e->active = false;
-			if (state.count > 0) state.count--;
-			continue;
+	// Track this frame's queue contribution separately from sub-pixel remainder
+	int32_t frame_x_fp = 0;
+	int32_t frame_y_fp = 0;
+	float movement_mag = 0.0f;
+
+	uint8_t remaining = state.count;
+	if (remaining > 0) {
+		for (uint8_t i = 0; i < SMOOTH_QUEUE_SIZE && remaining > 0; i++) {
+			queue_entry_t *e = &state.queue[i];
+			if (!e->active) continue;
+			if (e->frames_left == 0) {
+				e->active = false;
+				state.count--;
+				remaining--;
+				continue;
+			}
+
+			// Compute eased progress step using precomputed reciprocal
+			// progress = 1 - frames_left * inv_total
+			int32_t progress = SMOOTH_FP_ONE -
+				fp_mul(int_to_fp((int16_t)e->frames_left), e->inv_total_fp);
+			int32_t next_progress = SMOOTH_FP_ONE -
+				fp_mul(int_to_fp((int16_t)(e->frames_left - 1)), e->inv_total_fp);
+
+			int32_t eased_now  = ease_asymmetric(progress);
+			int32_t eased_next = ease_asymmetric(next_progress);
+			int32_t step_frac  = eased_next - eased_now;
+
+			// Original total was remaining / (remaining progress)
+			int32_t remaining_progress = SMOOTH_FP_ONE - eased_now;
+			int32_t frame_dx, frame_dy;
+			if (remaining_progress > 0) {
+				frame_dx = fp_mul(e->x_remaining_fp,
+					fp_div(step_frac, remaining_progress));
+				frame_dy = fp_mul(e->y_remaining_fp,
+					fp_div(step_frac, remaining_progress));
+			} else {
+				frame_dx = e->x_remaining_fp;
+				frame_dy = e->y_remaining_fp;
+			}
+
+			e->x_remaining_fp -= frame_dx;
+			e->y_remaining_fp -= frame_dy;
+			e->frames_left--;
+
+			// On last frame, flush any rounding remainder
+			if (e->frames_left == 0) {
+				frame_dx += e->x_remaining_fp;
+				frame_dy += e->y_remaining_fp;
+				e->x_remaining_fp = 0;
+				e->y_remaining_fp = 0;
+				e->active = false;
+				state.count--;
+				remaining--;
+			}
+
+			// Accumulate into frame contribution
+			frame_x_fp += frame_dx;
+			frame_y_fp += frame_dy;
+			movement_mag += fabsf((float)frame_dx) + fabsf((float)frame_dy);
 		}
-
-		// Compute eased progress step
-		// progress = 1 - frames_left / total_frames
-		int32_t progress = SMOOTH_FP_ONE -
-			fp_div(int_to_fp((int16_t)e->frames_left),
-			       int_to_fp((int16_t)e->total_frames));
-		int32_t next_progress = SMOOTH_FP_ONE -
-			fp_div(int_to_fp((int16_t)(e->frames_left - 1)),
-			       int_to_fp((int16_t)e->total_frames));
-
-		int32_t eased_now  = ease_in_out_cubic(progress);
-		int32_t eased_next = ease_in_out_cubic(next_progress);
-		int32_t step_frac  = eased_next - eased_now;
-
-		// Original total was remaining / (remaining progress)
-		int32_t remaining_progress = SMOOTH_FP_ONE - eased_now;
-		int32_t frame_dx, frame_dy;
-		if (remaining_progress > 0) {
-			frame_dx = fp_mul(e->x_remaining_fp,
-				fp_div(step_frac, remaining_progress));
-			frame_dy = fp_mul(e->y_remaining_fp,
-				fp_div(step_frac, remaining_progress));
-		} else {
-			frame_dx = e->x_remaining_fp;
-			frame_dy = e->y_remaining_fp;
-		}
-
-		e->x_remaining_fp -= frame_dx;
-		e->y_remaining_fp -= frame_dy;
-		e->frames_left--;
-
-		// On last frame, flush any rounding remainder
-		if (e->frames_left == 0) {
-			frame_dx += e->x_remaining_fp;
-			frame_dy += e->y_remaining_fp;
-			e->x_remaining_fp = 0;
-			e->y_remaining_fp = 0;
-			e->active = false;
-			if (state.count > 0) state.count--;
-		}
-
-		// Add humanization tremor scaled by movement magnitude
-		float mag = sqrtf((float)fp_mul(frame_dx, frame_dx) +
-		                  (float)fp_mul(frame_dy, frame_dy))
-		            / (float)SMOOTH_FP_ONE;
-		float scale = humanize_jitter_scale(mag);
-		float tdx, tdy;
-		humanize_get_tremor(scale, &tdx, &tdy);
-
-		// Add tremor as fixed-point
-		frame_dx += (int32_t)(tdx * (float)SMOOTH_FP_ONE);
-		frame_dy += (int32_t)(tdy * (float)SMOOTH_FP_ONE);
-
-		// Accumulate sub-pixel
-		state.x_accum_fp += frame_dx;
-		state.y_accum_fp += frame_dy;
 	}
+
+	// ---- EWMA correlated noise humanization ----
+	// Only active when smooth queue is producing movement.
+	// Two channels: speed (multiplicative) + perpendicular (additive wobble).
+	// Alpha=0.97 at 1kHz -> ~33ms correlation time (30Hz bandwidth).
+	if (movement_mag > 0.0f) {
+		state.speed_noise = 0.97f * state.speed_noise + 0.03f * smooth_lfsr_uniform();
+		state.perp_noise  = 0.97f * state.perp_noise  + 0.03f * smooth_lfsr_uniform();
+
+		// Speed perturbation: multiplicative, targets observed speed_cv ~0.40
+		// EWMA std ~0.071 * K_SPEED -> frame-level speed variation
+		float speed_mod = 1.0f + state.speed_noise * 4.0f;
+		frame_x_fp = (int32_t)((float)frame_x_fp * speed_mod);
+		frame_y_fp = (int32_t)((float)frame_y_fp * speed_mod);
+
+		// Perpendicular wobble: additive, targets perp_scatter ~0.25 px
+		float fx = (float)frame_x_fp;
+		float fy = (float)frame_y_fp;
+		float mag2 = fx * fx + fy * fy;
+		if (mag2 > 1.0f) {
+			float inv_mag = 1.0f / sqrtf(mag2);
+			// Perpendicular direction (90-degree rotation of movement)
+			float px = -fy * inv_mag;
+			float py =  fx * inv_mag;
+			float perp_px = state.perp_noise * 0.20f;
+			frame_x_fp += (int32_t)(px * perp_px * (float)SMOOTH_FP_ONE);
+			frame_y_fp += (int32_t)(py * perp_px * (float)SMOOTH_FP_ONE);
+		}
+	}
+
+	// Add frame contribution to sub-pixel accumulator
+	state.x_accum_fp += frame_x_fp;
+	state.y_accum_fp += frame_y_fp;
 
 	// Extract integer part, keep fractional remainder
 	int16_t ix = fp_to_int(state.x_accum_fp);

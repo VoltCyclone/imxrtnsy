@@ -1,5 +1,5 @@
-// tft_display.h — Stats rendering for TFT display
-// Renders USB proxy metrics onto the ST7735 framebuffer
+// tft_display.h — Stats + settings rendering for TFT display
+// Supports ST7735 (128x160) and ILI9341 (240x320) via TFT_DRIVER
 
 #pragma once
 #include <stdint.h>
@@ -44,12 +44,46 @@ typedef struct {
 	char     usb_product[22];   // truncated product name (21 chars + null)
 } tft_proxy_stats_t;
 
+// ---- View modes ----
+typedef enum {
+	TFT_VIEW_STATS,     // Default: proxy stats dashboard
+	TFT_VIEW_SETTINGS,  // Touch-driven settings menu
+} tft_view_t;
+
+// ---- Settings ----
+typedef enum {
+	SETTING_SMOOTH_ENABLED,
+	SETTING_SMOOTH_MAX,        // max displacement per frame
+	SETTING_HUMANIZE_ENABLED,
+	SETTING_BACKLIGHT,         // on/off
+	SETTING_COUNT
+} setting_id_t;
+
+typedef struct {
+	bool     smooth_enabled;
+	int16_t  smooth_max;       // max per frame (1-127)
+	bool     humanize_enabled;
+	bool     backlight;
+} tft_settings_t;
+
 // Initialize display hardware + draw splash screen
 void tft_display_init(void);
 
 // Render stats into framebuffer and flush to display.
-// Call from main loop at ~10 Hz (100ms intervals).
+// Call from main loop at ~30 Hz.
 void tft_display_update(const tft_proxy_stats_t *stats);
 
 // Show an error message (replaces normal display)
 void tft_display_error(const char *msg);
+
+// ---- Touch/settings (only active when TOUCH_ENABLED) ----
+
+// Process a touch event (coordinates in display space).
+// Returns true if a setting was changed.
+bool tft_display_touch(uint16_t x, uint16_t y);
+
+// Get current view mode
+tft_view_t tft_display_get_view(void);
+
+// Get current settings
+const tft_settings_t *tft_display_get_settings(void);

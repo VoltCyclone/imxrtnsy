@@ -82,10 +82,11 @@ FLASHMEM uint32_t set_arm_clock(uint32_t frequency)
 	uint32_t cbcmr = CCM_CBCMR;
 
 	if (frequency > 528000000) {
-		// Step 1: Raise core voltage for 600 MHz
+		// Step 1: Raise core voltage
+		// 600 MHz → TRG(15) ~1.25V; 816 MHz → TRG(19) ~1.30V
 		uint32_t dcdc = DCDC_REG3;
 		dcdc &= ~DCDC_REG3_TRG_MASK;
-		dcdc |= DCDC_REG3_TRG(15); // 1.25V
+		dcdc |= DCDC_REG3_TRG(frequency > 600000000 ? 19 : 15);
 		DCDC_REG3 = dcdc;
 		while (!(DCDC_REG0 & DCDC_REG0_STS_DC_OK)) ;
 
@@ -105,24 +106,28 @@ FLASHMEM uint32_t set_arm_clock(uint32_t frequency)
 		}
 
 		// Step 3: Configure ARM PLL (PLL1)
-		// PLL1 output = 24 MHz * DIV_SELECT / 2 = 24 * 100 / 2 = 1200 MHz
+		// PLL1 output = 24 MHz * DIV_SELECT / 2
+		// ARM clock = PLL1 / ARM_PODF(1+1) = PLL1 / 2
+		// So DIV_SELECT = frequency * 2 / (24 MHz / 2) = frequency / 6 MHz
+		// 600 MHz: DIV=100, PLL=1200 MHz, ARM=600 MHz
+		// 816 MHz: DIV=136, PLL=1632 MHz, ARM=816 MHz
+		uint32_t div_select = frequency / 6000000;
 		CCM_ANALOG_PLL_ARM = CCM_ANALOG_PLL_ARM_ENABLE |
-			CCM_ANALOG_PLL_ARM_DIV_SELECT(100);
+			CCM_ANALOG_PLL_ARM_DIV_SELECT(div_select);
 		while (!(CCM_ANALOG_PLL_ARM & CCM_ANALOG_PLL_ARM_LOCK)) ;
 
-		// Step 4: Set ARM_PODF = divide by 2 (1200 / 2 = 600 MHz)
-		// PRE_PERIPH_CLK_SEL(3) selects "divided PLL1" — this divider.
+		// Step 4: Set ARM_PODF = divide by 2
 		CCM_CACRR = CCM_CACRR_ARM_PODF(1);
 		while (CCM_CDHIPR & CCM_CDHIPR_ARM_PODF_BUSY) ;
 
-		// Step 5: Set AHB divider (divide by 1 → AHB = 600 MHz)
+		// Step 5: Set AHB divider (divide by 1 → AHB = target frequency)
 		cbcdr = CCM_CBCDR;
 		cbcdr &= ~(CCM_CBCDR_AHB_PODF_MASK | (0x07 << 16));
 		cbcdr |= CCM_CBCDR_AHB_PODF(0) | CCM_CBCDR_SEMC_PODF(7);
 		CCM_CBCDR = cbcdr;
 		while (CCM_CDHIPR & CCM_CDHIPR_AHB_PODF_BUSY) ;
 
-		// Step 6: Set IPG divider = 4 (600 / 4 = 150 MHz, max for IPG)
+		// Step 6: Set IPG divider = 4 (e.g. 816/4 = 204 MHz, 600/4 = 150 MHz)
 		cbcdr = CCM_CBCDR;
 		cbcdr &= ~CCM_CBCDR_IPG_PODF_MASK;
 		cbcdr |= CCM_CBCDR_IPG_PODF(3);
@@ -131,12 +136,12 @@ FLASHMEM uint32_t set_arm_clock(uint32_t frequency)
 		// Step 7: Select divided PLL1 on PRE_PERIPH mux, then switch back
 		cbcmr = CCM_CBCMR;
 		cbcmr &= ~CCM_CBCMR_PRE_PERIPH_CLK_SEL_MASK;
-		cbcmr |= CCM_CBCMR_PRE_PERIPH_CLK_SEL(3); // divided PLL1 = 600 MHz
+		cbcmr |= CCM_CBCMR_PRE_PERIPH_CLK_SEL(3);
 		CCM_CBCMR = cbcmr;
 		CCM_CBCDR &= ~CCM_CBCDR_PERIPH_CLK_SEL; // switch back from PERIPH_CLK2
 		while (CCM_CDHIPR & CCM_CDHIPR_PERIPH_CLK_SEL_BUSY) ;
 
-		F_CPU_ACTUAL = 600000000;
+		F_CPU_ACTUAL = frequency;
 	} else {
 		F_CPU_ACTUAL = 396000000;
 	}

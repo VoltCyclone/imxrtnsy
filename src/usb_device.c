@@ -15,10 +15,6 @@
 
 extern uint32_t millis(void);
 extern void delay(uint32_t msec);
-
-// ---- DMA-safe static allocations ----
-
-// 16 dQH entries (8 EP × 2 dir), 4KB-aligned
 static usb_dev_dqh_t dqh_list[USB_DEV_NUM_ENDPOINTS * 2]
 	__attribute__((section(".dmabuffers"), aligned(4096)));
 
@@ -32,21 +28,13 @@ static usb_dev_dtd_t dtd_int_tx[MAX_INT_EPS]
 static uint8_t ep0_tx_buf[512] __attribute__((section(".dmabuffers"), aligned(32)));
 static uint8_t int_tx_buf[MAX_INT_EPS][2][64]
 	__attribute__((section(".dmabuffers"), aligned(32)));
-
-// ---- State ----
-
 static const captured_descriptors_t *cap_desc;
 static usb_dev_state_t dev_state;
 static uint8_t ep_to_slot[USB_DEV_NUM_ENDPOINTS]; // EP num -> dtd/buf slot
 static uint8_t num_int_eps;
-
-// Bitmask state — bit N corresponds to EP N (bits 1-7 used, bit 0 unused)
 static uint8_t ep_busy_mask;     // bit set = EP has active DMA transfer in flight
 static uint8_t active_bank_mask; // bit set = EP using bank 1, clear = bank 0
 static uint8_t pending_len[USB_DEV_NUM_ENDPOINTS];  // 0 = no pending report staged
-
-// ---- Endpoint control register access ----
-
 static volatile uint32_t *endptctrl_reg(uint8_t ep)
 {
 	// ENDPTCTRL0-7 at offset 0x1C0 + ep*4
@@ -74,9 +62,6 @@ static void prime_int_ep(uint8_t ep_num, uint8_t slot, uint8_t bank, uint16_t le
 		active_bank_mask &= ~(1 << ep_num);
 	ep_busy_mask |= (1 << ep_num);
 }
-
-// ---- EP0 primitives ----
-
 static void ep0_tx_data(const uint8_t *data, uint16_t len)
 {
 	if (data && len > 0) {
@@ -91,8 +76,6 @@ static void ep0_tx_data(const uint8_t *data, uint16_t len)
 		dtd_ep0_tx.buffer[0] = (uint32_t)ep0_tx_buf;
 		dtd_ep0_tx.buffer[1] = ((uint32_t)ep0_tx_buf + 4096) & ~0xFFF;
 	}
-
-	// Link dTD to EP0 TX dQH (index 1) and prime
 	dqh_list[1].next = (uint32_t)&dtd_ep0_tx;
 	dqh_list[1].token = 0;
 	asm volatile("dsb" ::: "memory");
@@ -121,9 +104,6 @@ static void ep0_stall(void)
 {
 	USB1_ENDPTCTRL0 |= USB_ENDPTCTRL_TXS | USB_ENDPTCTRL_RXS;
 }
-
-// ---- Request handlers ----
-
 static void handle_get_descriptor(const usb_setup_t *setup)
 {
 	uint8_t desc_type = setup->wValue >> 8;
@@ -145,12 +125,10 @@ static void handle_get_descriptor(const usb_setup_t *setup)
 
 	case USB_DESC_STRING:
 		if (desc_index == 0) {
-			// Language ID descriptor
 			static const uint8_t lang_desc[] = {0x04, 0x03, 0x09, 0x04};
 			data = lang_desc;
 			len = 4;
 		} else {
-			// Look up by original USB string index
 			for (uint8_t i = 0; i < cap_desc->num_strings; i++) {
 				if (cap_desc->string_index[i] == desc_index) {
 					data = cap_desc->string_desc[i];
@@ -172,7 +150,6 @@ static void handle_get_descriptor(const usb_setup_t *setup)
 		break;
 
 	case USB_DESC_HID_REPORT:
-		// Route by interface number (wIndex)
 		{
 			uint16_t iface_num = setup->wIndex;
 			for (uint8_t i = 0; i < cap_desc->num_ifaces; i++) {
@@ -187,7 +164,6 @@ static void handle_get_descriptor(const usb_setup_t *setup)
 		break;
 
 	case USB_DESC_HID:
-		// HID class descriptor — find the one matching wIndex (interface number)
 		{
 			uint16_t target_iface = setup->wIndex;
 			const uint8_t *p = cap_desc->config_desc;
@@ -229,7 +205,6 @@ static void handle_set_address(const usb_setup_t *setup)
 {
 	uint8_t addr = setup->wValue & 0x7F;
 
-	// USBADRA: hardware applies address after status stage completes
 	USB1_DEVICEADDR = USB_DEVICEADDR_USBADR(addr) | USB_DEVICEADDR_USBADRA;
 
 	ep0_tx_data(NULL, 0);
@@ -282,7 +257,6 @@ static void handle_set_configuration(const usb_setup_t *setup)
 
 	if (config_val == 0) {
 		dev_state = USB_DEV_STATE_ADDRESS;
-		// Flush all interrupt EPs
 		for (uint8_t i = 0; i < cap_desc->num_ifaces; i++) {
 			uint8_t ep_num = cap_desc->ifaces[i].interrupt_ep & 0x0F;
 			if (ep_num == 0 || ep_num >= USB_DEV_NUM_ENDPOINTS) continue;
@@ -369,7 +343,6 @@ static void handle_class_request(const usb_setup_t *setup)
 		}
 		break;
 	case 0x09: // SET_REPORT
-		// Accept and discard — send ZLP status
 		ep0_tx_data(NULL, 0);
 		break;
 	case 0x03: // GET_PROTOCOL
@@ -383,14 +356,9 @@ static void handle_class_request(const usb_setup_t *setup)
 		break;
 	}
 }
-
-// ---- SETUP packet handling ----
-
 static void handle_setup_packet(void)
 {
 	usb_setup_t setup;
-
-	// Read SETUP data using SUTW semaphore
 	do {
 		USB1_USBCMD |= USB_USBCMD_SUTW;
 		uint32_t s0 = dqh_list[0].setup0;
@@ -403,16 +371,10 @@ static void handle_setup_packet(void)
 	} while (!(USB1_USBCMD & USB_USBCMD_SUTW));
 
 	USB1_USBCMD &= ~USB_USBCMD_SUTW;
-
-	// Acknowledge SETUP
 	USB1_ENDPTSETUPSTAT = 1;
 	while (USB1_ENDPTSETUPSTAT & 1) ;
-
-	// Flush stale EP0 transfers
 	USB1_ENDPTFLUSH = (1 << 16) | (1 << 0); // Flush EP0 TX and RX
 	while (USB1_ENDPTFLUSH) ;
-
-	// Dispatch based on request type (bits 6:5 of bmRequestType)
 	uint8_t req_type = setup.bmRequestType & 0x60;
 
 	if (req_type == 0x00) {
@@ -423,9 +385,6 @@ static void handle_setup_packet(void)
 		ep0_stall();
 	}
 }
-
-// ---- Bus reset ----
-
 static void handle_bus_reset(void)
 {
 	USB1_ENDPTSETUPSTAT = USB1_ENDPTSETUPSTAT;
@@ -434,12 +393,8 @@ static void handle_bus_reset(void)
 	while (USB1_ENDPTPRIME) ;
 	USB1_ENDPTFLUSH = 0xFFFFFFFF;
 	while (USB1_ENDPTFLUSH) ;
-
-	// Reset address
 	USB1_DEVICEADDR = 0;
 	dev_state = USB_DEV_STATE_DEFAULT;
-
-	// Re-init EP0 dQH
 	dqh_list[0].next = DTD_TERMINATE;
 	dqh_list[0].token = 0;
 	dqh_list[1].next = DTD_TERMINATE;
@@ -452,9 +407,6 @@ static void handle_bus_reset(void)
 	num_int_eps = 0;
 	memset(ep_to_slot, 0xFF, sizeof(ep_to_slot));
 }
-
-// ---- Public API ----
-
 bool usb_device_init(const captured_descriptors_t *desc)
 {
 	cap_desc = desc;
@@ -469,16 +421,8 @@ bool usb_device_init(const captured_descriptors_t *desc)
 	PMU_REG_3P0 = PMU_REG_3P0_OUTPUT_TRG(0x0F) |
 		PMU_REG_3P0_BO_OFFSET(6) |
 		PMU_REG_3P0_ENABLE_LINREG;
-
-	// Gate clock for USB1/USB2 controller block (USBOH3).
 	CCM_CCGR6 |= CCM_CCGR6_USBOH3(CCM_CCGR_ON);
-
-	// Recommended bus burst settings used by Teensy core.
-	// Set before conditional reset since the unconditional path doesn't
-	// reset the controller again (matching PJRC usb.c sequence).
 	USB1_BURSTSIZE = 0x0404;
-
-	// If PHY was previously in use, perform a clean-slate reset
 	if ((USBPHY1_PWD & (USBPHY_PWD_RXPWDRX | USBPHY_PWD_RXPWDDIFF |
 		USBPHY_PWD_RXPWD1PT1 | USBPHY_PWD_RXPWDENV |
 		USBPHY_PWD_TXPWDV2I | USBPHY_PWD_TXPWDIBIAS |
@@ -490,40 +434,20 @@ bool usb_device_init(const captured_descriptors_t *desc)
 		USBPHY1_CTRL_CLR = USBPHY_CTRL_SFTRST;
 		delay(25);
 	}
-
-	// Power up USBPHY1 (match PJRC usb.c — only clkgate + pwd)
 	USBPHY1_CTRL_CLR = USBPHY_CTRL_CLKGATE;
 	USBPHY1_PWD = 0;
-
-	// Set device mode with setup lockout (must be done right after reset)
 	USB1_USBMODE = USB_USBMODE_CM(2) | USB_USBMODE_SLOM;
-
-	// 4. Initialize dQH array
 	memset(dqh_list, 0, sizeof(dqh_list));
-
-	// EP0 RX (OUT) — index 0: maxpkt=64, IOS for setup interrupt
 	dqh_list[0].config = DQH_MAX_PACKET(64) | DQH_IOS;
 	dqh_list[0].next = DTD_TERMINATE;
-
-	// EP0 TX (IN) — index 1: maxpkt=64
 	dqh_list[1].config = DQH_MAX_PACKET(64);
 	dqh_list[1].next = DTD_TERMINATE;
-
 	asm volatile("dsb" ::: "memory");
-
-	// 5. Set endpoint list address
 	USB1_ENDPOINTLISTADDR = (uint32_t)dqh_list;
-
-	// 6. Enable core USB status sources (we still poll USBSTS).
 	USB1_USBINTR = USB_USBINTR_UE | USB_USBINTR_UEE |
 		USB_USBINTR_URE | USB_USBINTR_SLE;
-
-	// 7. Clear all pending status
 	USB1_USBSTS = USB1_USBSTS;
-
-	// 8. Start controller (direct assignment, not |=, per PJRC usb.c)
 	USB1_USBCMD = USB_USBCMD_RS;
-
 	return true;
 }
 
@@ -531,34 +455,21 @@ void usb_device_poll(void)
 {
 	uint32_t status = USB1_USBSTS;
 	USB1_USBSTS = status; // Write-to-clear
-
-	// Bus reset
-	if (status & USB_USBSTS_URI) {
+	if (__builtin_expect(status & USB_USBSTS_URI, 0)) {
 		handle_bus_reset();
 	}
-
-	// Transfer complete / SETUP
 	if (status & USB_USBSTS_UI) {
-		// Check for SETUP packet on EP0
 		if (USB1_ENDPTSETUPSTAT & 1) {
 			handle_setup_packet();
 		}
-
-		// Check for endpoint completions
 		uint32_t complete = USB1_ENDPTCOMPLETE;
 		if (complete) {
 			USB1_ENDPTCOMPLETE = complete;
-
-			// Mask completed TX EPs against busy set — only process real completions
 			uint8_t done = (uint8_t)(complete >> 16) & ep_busy_mask;
 			ep_busy_mask &= ~done; // clear all done EPs in one shot
-
-			// Iterate only the completed EPs via CTZ (no scanning idle EPs)
 			while (done) {
 				uint8_t ep = (uint8_t)__builtin_ctz(done);
 				done &= done - 1; // clear lowest set bit
-
-				// If a report was staged in the other bank, send it now
 				if (pending_len[ep] > 0) {
 					uint8_t slot = ep_to_slot[ep];
 					uint8_t bank = ((active_bank_mask >> ep) ^ 1) & 1;
@@ -581,14 +492,11 @@ bool usb_device_send_report(uint8_t ep_num, const uint8_t *data, uint16_t len)
 
 	uint8_t ep_bit = (1 << ep_num);
 	if (ep_busy_mask & ep_bit) {
-		// EP is in-flight — stage report in the other bank (overwrites stale pending)
 		uint8_t bank = ((active_bank_mask >> ep_num) ^ 1) & 1;
 		memcpy(int_tx_buf[slot][bank], data, len);
 		pending_len[ep_num] = (uint8_t)len;
 		return true; // staged, not dropped
 	}
-
-	// EP is free — send immediately from current bank
 	uint8_t bank = (active_bank_mask >> ep_num) & 1;
 	memcpy(int_tx_buf[slot][bank], data, len);
 	prime_int_ep(ep_num, slot, bank, len);

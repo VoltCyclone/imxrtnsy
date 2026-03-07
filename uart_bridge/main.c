@@ -95,15 +95,9 @@ int main(void)
 	while (1) {
 		bool usb_connected = stdio_usb_connected();
 		bool had_data = false;
-
-		// Interleave CDC->UART and UART->CDC to prevent RX FIFO overflow.
-		// Process a small batch from CDC, then drain all pending UART RX,
-		// and repeat until both are empty.
 		bool did_work;
 		do {
 			did_work = false;
-
-			// CDC -> UART (limited batch to let UART RX drain)
 			if (usb_connected) {
 				for (int i = 0; i < 32; i++) {
 					int ch = getchar_timeout_us(0);
@@ -113,8 +107,6 @@ int main(void)
 					did_work = true;
 				}
 			}
-
-			// UART -> CDC
 			while (uart_is_readable(UART_ID)) {
 				char c = uart_getc(UART_ID);
 				if (usb_connected)
@@ -126,8 +118,6 @@ int main(void)
 
 		if (had_data)
 			last_data_ms = to_ms_since_boot(get_absolute_time());
-
-		// Update status
 		uint32_t now = to_ms_since_boot(get_absolute_time());
 		if (!usb_connected) {
 			status = ST_NO_USB;
@@ -136,8 +126,6 @@ int main(void)
 		} else {
 			status = ST_IDLE;
 		}
-
-		// NeoPixel update at ~30 Hz
 		if ((now - last_neo_ms) >= 33) {
 			last_neo_ms = now;
 			switch (status) {

@@ -1,26 +1,20 @@
-// tft.c — ST7735 TFT display driver for i.MX RT1062
-// Bare-metal LPSPI4 + eDMA, double-buffered 8-bit indexed framebuffer
-// Row-by-row palette lookup (8-bit→RGB565) + DMA transfer to SPI
-
 #include "tft.h"
 #include "imxrt.h"
 #include <string.h>
 
 extern void delay(uint32_t msec);
-
-// ---- Double-buffered framebuffers in non-cacheable DMA region ----
+#if TFT_DRIVER == TFT_DRIVER_ILI9341
+static uint8_t fb[2][TFT_FB_SIZE] __attribute__((aligned(32)));
+#else
 static uint8_t fb[2][TFT_FB_SIZE]
 	__attribute__((section(".dmabuffers"), aligned(32)));
+#endif
 
-// Per-row transfer buffers (ping-pong for DMA overlap)
-// Each entry packs 2 RGB565 pixels for 32-bit SPI frames
 static uint32_t txbuf[2][TFT_WIDTH / 2]
 	__attribute__((section(".dmabuffers"), aligned(32)));
 
 uint8_t *tft_input;
 static uint8_t *tft_committed;
-
-// Palette from RaspberryKMBox/bridge (ISC license)
 uint16_t __attribute__((__aligned__(512))) tft_palette[256] = {
 	0x0000, 0x1082, 0x2104, 0x31a6, 0x4228, 0x52aa, 0x632c, 0x73ae,
 	0x8c51, 0x9cd3, 0xad55, 0xbdd7, 0xce59, 0xdefb, 0xef7d, 0xffff,
@@ -56,9 +50,6 @@ uint16_t __attribute__((__aligned__(512))) tft_palette[256] = {
 	0x051f, 0x023f, 0x181f, 0x781f, 0xd81f, 0xf818, 0xf80c, 0xf800,
 };
 
-// ---- GPIO helpers ----
-// All TFT GPIO pins live on GPIO7 (fast GPIO for GPIO_B0_xx and GPIO_B1_xx)
-
 static inline void gpio_cs_low(void)  { GPIO7_DR_CLEAR = (1u << TFT_CS_PIN_BIT); }
 static inline void gpio_cs_high(void) { GPIO7_DR_SET   = (1u << TFT_CS_PIN_BIT); }
 static inline void gpio_dc_low(void)  { GPIO7_DR_CLEAR = (1u << TFT_DC_PIN_BIT); }
@@ -67,12 +58,8 @@ static inline void gpio_rst_low(void) { GPIO7_DR_CLEAR = (1u << TFT_RST_PIN_BIT)
 static inline void gpio_rst_high(void){ GPIO7_DR_SET   = (1u << TFT_RST_PIN_BIT); }
 static inline void gpio_bl_on(void)   { GPIO7_DR_SET   = (1u << TFT_BL_PIN_BIT); }
 
-// ---- SPI helpers (blocking, used for init commands only) ----
-
-// Write a single byte over LPSPI4 in 8-bit mode, blocking
 static void spi_write8_blocking(uint8_t b)
 {
-	// Set 8-bit frame, RX masked, no continuous
 	LPSPI4_TCR = LPSPI_TCR_FRAMESZ(7) | LPSPI_TCR_RXMSK;
 	LPSPI4_TDR = b;
 	while (!(LPSPI4_SR & LPSPI_SR_TCF))
@@ -80,21 +67,17 @@ static void spi_write8_blocking(uint8_t b)
 	LPSPI4_SR = LPSPI_SR_TCF; // clear flag
 }
 
-// Write data bytes over LPSPI4 in 8-bit mode
 static void spi_write_blocking(const uint8_t *data, size_t len)
 {
 	for (size_t i = 0; i < len; i++)
 		spi_write8_blocking(data[i]);
 }
 
-// Wait for SPI module to be idle (no transfer in progress)
 static inline void spi_wait_idle(void)
 {
 	while (LPSPI4_SR & LPSPI_SR_MBF)
 		;
 }
-
-// ---- Command interface ----
 
 void tft_command(uint8_t cmd, const uint8_t *data, size_t len)
 {
@@ -112,72 +95,50 @@ void tft_command(uint8_t cmd, const uint8_t *data, size_t len)
 	gpio_cs_high();
 }
 
-// ---- Initialization ----
-
 void tft_init(void)
 {
 	tft_input = fb[0];
 	tft_committed = fb[1];
 	memset(fb[0], 0, TFT_FB_SIZE);
 	memset(fb[1], 0xFF, TFT_FB_SIZE); // differ from fb[0] to force first full sync
-
-	// ---- Clock gating ----
 	CCM_CCGR1 |= CCM_CCGR1_LPSPI4(CCM_CCGR_ON);
 	CCM_CCGR5 |= CCM_CCGR5_DMA(CCM_CCGR_ON); // already on, harmless
-
-	// LPSPI clock source: PLL2 (528 MHz), divider = 3+1 = 4 → 132 MHz
 	CCM_CBCMR = (CCM_CBCMR & ~(CCM_CBCMR_LPSPI_CLK_SEL_MASK |
 	             CCM_CBCMR_LPSPI_PODF_MASK))
 	          | CCM_CBCMR_LPSPI_CLK_SEL(2)
 	          | CCM_CBCMR_LPSPI_PODF(3);
-
-	// ---- Pin mux ----
-	// Pin 13 (GPIO_B0_03) = LPSPI4_SCK (ALT3)
 	IOMUXC_SW_MUX_CTL_PAD_GPIO_B0_03 = 3;
 	IOMUXC_SW_PAD_CTL_PAD_GPIO_B0_03 = IOMUXC_PAD_DSE(7) | IOMUXC_PAD_SPEED(3);
 	IOMUXC_LPSPI4_SCK_SELECT_INPUT = 0; // GPIO_B0_03
-
-	// Pin 11 (GPIO_B0_02) = LPSPI4_SDO (ALT3)
 	IOMUXC_SW_MUX_CTL_PAD_GPIO_B0_02 = 3;
 	IOMUXC_SW_PAD_CTL_PAD_GPIO_B0_02 = IOMUXC_PAD_DSE(7) | IOMUXC_PAD_SPEED(3);
 	IOMUXC_LPSPI4_SDO_SELECT_INPUT = 0; // GPIO_B0_02
-
-	// Pin 10 (GPIO_B0_00) = CS as GPIO (ALT5)
 	IOMUXC_SW_MUX_CTL_PAD_GPIO_B0_00 = 5;
 	IOMUXC_SW_PAD_CTL_PAD_GPIO_B0_00 = IOMUXC_PAD_DSE(6) | IOMUXC_PAD_SPEED(2);
 	GPIO7_GDIR |= (1u << TFT_CS_PIN_BIT);
 	gpio_cs_high();
-
-	// Pin 9 (GPIO_B0_11) = DC as GPIO (ALT5)
 	IOMUXC_SW_MUX_CTL_PAD_GPIO_B0_11 = 5;
 	IOMUXC_SW_PAD_CTL_PAD_GPIO_B0_11 = IOMUXC_PAD_DSE(6) | IOMUXC_PAD_SPEED(2);
 	GPIO7_GDIR |= (1u << TFT_DC_PIN_BIT);
 	gpio_dc_high();
-
-	// Pin 6 (GPIO_B0_10) = RST as GPIO (ALT5)
 	IOMUXC_SW_MUX_CTL_PAD_GPIO_B0_10 = 5;
 	IOMUXC_SW_PAD_CTL_PAD_GPIO_B0_10 = IOMUXC_PAD_DSE(6) | IOMUXC_PAD_SPEED(2);
 	GPIO7_GDIR |= (1u << TFT_RST_PIN_BIT);
 	gpio_rst_high();
-
-	// Pin 7 (GPIO_B1_01) = Backlight as GPIO (ALT5)
 	IOMUXC_SW_MUX_CTL_PAD_GPIO_B1_01 = 5;
 	IOMUXC_SW_PAD_CTL_PAD_GPIO_B1_01 = IOMUXC_PAD_DSE(6) | IOMUXC_PAD_SPEED(2);
 	GPIO7_GDIR |= (1u << TFT_BL_PIN_BIT);
 	gpio_bl_on();
-
-	// ---- LPSPI4 configuration ----
 	LPSPI4_CR = LPSPI_CR_RST; // software reset
 	LPSPI4_CR = 0;
-	// Master mode, no stall on TX underrun
 	LPSPI4_CFGR1 = LPSPI_CFGR1_MASTER | LPSPI_CFGR1_NOSTALL;
-	// SCK = lpspi_clk / (SCKDIV+2) = 132 MHz / (0+2) = 66 MHz
-	LPSPI4_CCR = LPSPI_CCR_SCKDIV(0) | LPSPI_CCR_SCKPCS(1) | LPSPI_CCR_PCSSCK(1);
-	// TX FIFO watermark: request DMA when ≥1 entry free
+#if TFT_DRIVER == TFT_DRIVER_ILI9341
+	LPSPI4_CCR = LPSPI_CCR_SCKDIV(1) | LPSPI_CCR_SCKPCS(1) | LPSPI_CCR_PCSSCK(1);
+#else
+	LPSPI4_CCR = LPSPI_CCR_SCKDIV(7) | LPSPI_CCR_SCKPCS(1) | LPSPI_CCR_PCSSCK(1);
+#endif
 	LPSPI4_FCR = LPSPI_FCR_TXWATER(0);
-	// Default TCR: 8-bit, RX masked (set per-transfer)
 	LPSPI4_TCR = LPSPI_TCR_FRAMESZ(7) | LPSPI_TCR_RXMSK;
-	// Enable module
 	LPSPI4_CR = LPSPI_CR_MEN;
 
 	// ---- eDMA channel 1: txbuf[] → LPSPI4_TDR (32-bit packed pixel pairs) ----
@@ -195,20 +156,16 @@ void tft_init(void)
 	DMA_TCD1_DLASTSGA = 0;
 	DMA_TCD1_CSR = DMA_TCD_CSR_DREQ; // auto-disable request on major complete
 	DMAMUX_CHCFG1 = DMAMUX_SOURCE_LPSPI4_TX | DMAMUX_CHCFG_ENBL;
-	// Enable DMA request from LPSPI4 TX FIFO
 	LPSPI4_DER = LPSPI_DER_TDDE;
 
-	// ---- Hardware reset of ST7735 ----
+	// ---- Hardware reset ----
 	gpio_rst_low();
 	delay(50);
 	gpio_rst_high();
 	delay(50);
 
-	// Run controller init sequence (in st7735.c)
 	tft_preflight();
 }
-
-// ---- Double buffering ----
 
 void tft_swap_buffers(void)
 {
@@ -217,49 +174,62 @@ void tft_swap_buffers(void)
 	tft_input = tmp;
 }
 
-// ---- Display sync: dirty-row partial update + DMA ----
-// Compares committed (new) vs input (old) framebuffer to find changed rows.
-// Only sends dirty row spans via RASET+RAMWR, skipping identical rows.
-// Saves ~75% SPI bandwidth on a stats dashboard where most rows are static.
+#define TFT_ROW_WORDS  (TFT_WIDTH / 4)
+#define TFT_DIRTY_WORDS ((TFT_HEIGHT + 31) / 32)
 
 void tft_sync(void)
 {
-	// Compare old vs new framebuffers — build 160-bit dirty row bitmask
-	// Each row is 128 bytes = 32 words; early-exit on first difference per row
 	const uint32_t *np = (const uint32_t *)tft_committed;
 	const uint32_t *op = (const uint32_t *)tft_input;
-	uint32_t dirty[5] = {0, 0, 0, 0, 0};
+	uint32_t dirty[TFT_DIRTY_WORDS];
+	for (int i = 0; i < TFT_DIRTY_WORDS; i++) dirty[i] = 0;
 
 	for (int y = 0; y < TFT_HEIGHT; y++) {
-		for (int w = 0; w < 32; w++) {
+		for (int w = 0; w < TFT_ROW_WORDS; w++) {
 			if (np[w] != op[w]) {
 				dirty[y >> 5] |= (1u << (y & 31));
 				break;
 			}
 		}
-		np += 32;
-		op += 32;
+		np += TFT_ROW_WORDS;
+		op += TFT_ROW_WORDS;
 	}
 
-	// Scan dirty bitmask for contiguous spans
 	int y = 0;
 	while (y < TFT_HEIGHT) {
-		// Skip clean rows
-		while (y < TFT_HEIGHT && !(dirty[y >> 5] & (1u << (y & 31))))
-			y++;
+		while (y < TFT_HEIGHT) {
+			uint32_t word = dirty[y >> 5] >> (y & 31);
+			if (word) {
+				y += __builtin_ctz(word);
+				break;
+			}
+			y = (y | 31) + 1;
+		}
 		if (y >= TFT_HEIGHT) break;
 
 		int ys = y;
-		// Extend to end of contiguous dirty rows
-		while (y < TFT_HEIGHT && (dirty[y >> 5] & (1u << (y & 31))))
-			y++;
+		while (y < TFT_HEIGHT) {
+			uint32_t word = dirty[y >> 5] >> (y & 31);
+			if (word == 0) break;
+			uint32_t inv = ~word;
+			if (inv) {
+				y += __builtin_ctz(inv);
+				break;
+			}
+			y = (y | 31) + 1;
+		}
+		if (y > TFT_HEIGHT) y = TFT_HEIGHT;
 		int ye = y - 1;
 
-		// Set row window for this dirty span
-		uint8_t raset[] = { 0, (uint8_t)ys, 0, (uint8_t)ye };
+		uint8_t caset[] = { 0, 0, (uint8_t)((TFT_WIDTH - 1) >> 8),
+		                    (uint8_t)(TFT_WIDTH - 1) };
+		tft_command(0x2a, caset, 4);
+		uint8_t raset[] = {
+			(uint8_t)(ys >> 8), (uint8_t)ys,
+			(uint8_t)(ye >> 8), (uint8_t)ye
+		};
 		tft_command(0x2b, raset, 4);
 
-		// RAMWR — send command byte, keep CS low for pixel data
 		gpio_dc_low();
 		gpio_cs_low();
 		spi_write8_blocking(0x2c);
@@ -274,7 +244,6 @@ void tft_sync(void)
 		for (int r = 0; r < span_rows; r++) {
 			uint32_t *buf = txbuf[r & 1];
 
-			// 4-wide palette lookup: pack 2 RGB565 pixels per 32-bit word
 			for (int x = 0; x < TFT_WIDTH / 2; x += 2) {
 				uint32_t idx4 = *(const uint32_t *)inptr;
 				uint16_t p0 = tft_palette[idx4 & 0xFF];
@@ -286,7 +255,6 @@ void tft_sync(void)
 				inptr += 4;
 			}
 
-			// Wait for previous row DMA (skip on first row of span)
 			if (r > 0) {
 				while (!(DMA_TCD1_CSR & DMA_TCD_CSR_DONE))
 					;
@@ -305,7 +273,6 @@ void tft_sync(void)
 		while (!(DMA_TCD1_CSR & DMA_TCD_CSR_DONE))
 			;
 
-		// End continuous SPI mode and release CS
 		LPSPI4_TCR = LPSPI_TCR_FRAMESZ(31) | LPSPI_TCR_RXMSK;
 		spi_wait_idle();
 		gpio_cs_high();
@@ -318,7 +285,6 @@ void tft_swap_sync(void)
 	tft_sync();
 }
 
-// ---- Drawing primitives ----
 
 void tft_fill(uint8_t color)
 {
@@ -334,7 +300,6 @@ void tft_draw_pixel(int x, int y, uint8_t color)
 
 void tft_draw_rect(int x0, int y0, int x1, int y1, uint8_t color)
 {
-	// Clamp to display bounds
 	if (x0 < 0) x0 = 0;
 	if (y0 < 0) y0 = 0;
 	if (x1 >= TFT_WIDTH)  x1 = TFT_WIDTH - 1;
@@ -356,7 +321,6 @@ void tft_draw_hline(int x0, int x1, int y, uint8_t color)
 
 void tft_draw_glyph(int x, int y, uint8_t color, char c)
 {
-	// Fast path: fully on-screen
 	if (x >= 0 && x + TFT_FONT_W <= TFT_WIDTH &&
 	    y >= 0 && y + TFT_FONT_H <= TFT_HEIGHT) {
 		const uint8_t *glyph = tft_font + (unsigned char)c * TFT_FONT_H;
@@ -376,7 +340,6 @@ void tft_draw_glyph(int x, int y, uint8_t color, char c)
 		return;
 	}
 
-	// Slow path: clipped
 	const uint8_t *glyph = tft_font + (unsigned char)c * TFT_FONT_H;
 	for (int gy = 0; gy < TFT_FONT_H; gy++) {
 		uint8_t bits = glyph[gy];
