@@ -12,6 +12,7 @@
 #include "desc_capture.h"
 #include "kmbox.h"
 #include "smooth.h"
+#include "gpt_profile.h"
 #if TFT_ENABLED
 #include "tft_display.h"
 #endif
@@ -35,7 +36,52 @@ static void led_blink_forever(uint8_t code, uint32_t on_ms, uint32_t off_ms)
 	tft_display_error("FATAL");
 	while (1) delay(1000);
 }
+static void led_pwm_init(void) { }
+static void led_pwm_set(uint8_t brightness) { (void)brightness; }
 #else
+// ---- FlexPWM2 channel A02 on pin 13 (GPIO_B0_03 ALT1) ----
+// Hardware PWM for LED brightness: zero CPU overhead after setup.
+// PWM frequency ~1kHz at IPG/128 prescaler.
+static bool led_pwm_active;
+
+static void led_pwm_init(void)
+{
+	// Enable FlexPWM2 clock
+	CCM_CCGR4 |= CCM_CCGR4_PWM2(CCM_CCGR_ON);
+
+	// Submodule 2: center-aligned PWM, IPG clock with /128 prescaler
+	// IPG = 204MHz/128 = ~1.59MHz, period=1594 -> ~1kHz PWM
+	FLEXPWM2_SM2CTRL2 = 0;
+	FLEXPWM2_SM2CTRL  = (7 << 4); // PRSC = /128
+	FLEXPWM2_SM2INIT  = 0;
+	FLEXPWM2_SM2VAL0  = 0;
+	FLEXPWM2_SM2VAL1  = 1594;  // period
+	FLEXPWM2_SM2VAL2  = 0;     // PWMA rising edge
+	FLEXPWM2_SM2VAL3  = 0;     // PWMA falling edge (duty=0 initially)
+	FLEXPWM2_SM2DISMAP0 = 0xF000; // no fault disable
+	FLEXPWM2_SM2DISMAP1 = 0xF000;
+
+	// Load registers, run submodule 2
+	FLEXPWM2_MCTRL |= (1 << 6);  // LDOK submodule 2
+	FLEXPWM2_MCTRL |= (1 << 10); // RUN submodule 2
+	FLEXPWM2_OUTEN |= (1 << 10); // PWMA_EN submodule 2
+
+	// Mux pin 13 (GPIO_B0_03) to ALT1 = FLEXPWM2_PWMA02
+	IOMUXC_SW_MUX_CTL_PAD_GPIO_B0_03 = 1;
+	IOMUXC_SW_PAD_CTL_PAD_GPIO_B0_03 = IOMUXC_PAD_DSE(6) | IOMUXC_PAD_SPEED(2);
+
+	led_pwm_active = true;
+}
+
+// Set LED brightness 0-255 via PWM duty cycle (zero CPU after register write)
+static void led_pwm_set(uint8_t brightness)
+{
+	if (!led_pwm_active) return;
+	uint16_t duty = ((uint32_t)brightness * 1594) >> 8;
+	FLEXPWM2_SM2VAL3 = duty;
+	FLEXPWM2_MCTRL |= (1 << 6); // LDOK to latch new VAL3
+}
+
 static void led_on(void)  { GPIO7_DR_SET = (1 << 3); }
 static void led_off(void) { GPIO7_DR_CLEAR = (1 << 3); }
 static void led_toggle(void) __attribute__((unused));
@@ -85,11 +131,21 @@ typedef struct {
 	uint8_t  iface_protocol;  // 1=keyboard, 2=mouse (for kmbox merge)
 } ep_mapping_t;
 
-// ---- PIT0: 1kHz tick for smooth injection timing ----
+// ---- PIT0: smooth injection timing with humanized jitter ----
 static volatile bool pit_tick_pending;
+static volatile bool pit_tick_skip;      // true = suppress this frame (missed poll)
+static uint32_t pit_base_ldval;          // nominal reload value (set after enumeration)
+
 static void pit0_isr(void)
 {
-	PIT_TFLG0 = PIT_TFLG_TIF; // clear interrupt flag
+	PIT_TFLG0 = PIT_TFLG_TIF;
+
+	// Compute next interval + skip decision (all integer, ~12 cycles)
+	bool skip = false;
+	uint32_t next_ldval = smooth_timing_next(pit_base_ldval, &skip);
+	PIT_LDVAL0 = next_ldval;
+
+	pit_tick_skip = skip;
 	pit_tick_pending = true;
 }
 
@@ -187,6 +243,7 @@ int main(void)
 	NVIC_ENABLE_IRQ(IRQ_PIT);
 
 	tempmon_init();
+	gpt_profile_init(); // GPT2: free-running µs counter for profiling
 
 	uart_puts("\r\n\r\nimxrtnsy: USB proxy\r\n");
 	uart_puts("Teensy 4.1 — i.MX RT1062\r\n\r\n");
@@ -313,6 +370,7 @@ int main(void)
 		if (interval_us > 10000) interval_us = 10000;
 		uint32_t ipg_mhz = (F_CPU / 4u) / 1000000u; // IPG = ARM / 4
 		uint32_t ldval = (ipg_mhz * interval_us) - 1;
+		pit_base_ldval = ldval;
 		PIT_LDVAL0 = ldval;
 		PIT_TCTRL0 = PIT_TCTRL_TIE | PIT_TCTRL_TEN;
 		smooth_init(interval_us);
@@ -336,6 +394,7 @@ int main(void)
 		}
 	}
 	led_off();
+	led_pwm_init(); // Switch pin 13 to FlexPWM (no-op when TFT active)
 #if TFT_ENABLED
 	tft_display_init();
 #endif
@@ -352,6 +411,8 @@ int main(void)
 	uint32_t loop_count = 0;
 	uint32_t last_heartbeat = millis();
 	uint32_t led_off_time = 0; // non-blocking LED pulse
+	uint32_t led_pwm_update = millis();
+	uint32_t led_report_snapshot = 0;
 
 #if TFT_ENABLED
 	uint32_t last_tft_update = millis();
@@ -363,21 +424,30 @@ int main(void)
 	while (1) {
 		usb_device_poll();
 		kmbox_poll();
+		bool did_work = false;
 		if (pit_tick_pending) {
 			pit_tick_pending = false;
-			int16_t sx, sy;
-			smooth_process_frame(&sx, &sy);
-			if (sx || sy) kmbox_inject_smooth(sx, sy);
+			did_work = true;
+			if (!pit_tick_skip) {
+				int16_t sx, sy;
+				smooth_process_frame(&sx, &sy);
+				if (sx || sy) kmbox_inject_smooth(sx, sy);
+			}
+			// When skip=true, no report this tick — mimics missed USB poll.
+			// Accumulated sub-pixel state preserved; next frame catches up.
 		}
 
 		for (uint8_t m = 0; m < num_ep_mappings; m++) {
-			ret = usb_host_interrupt_poll(ep_map[m].host_slot,
-				report_buf, ep_map[m].maxpkt);
-			if (ret > 0) {
+			uint8_t *rpt_ptr = NULL;
+			ret = usb_host_interrupt_poll_zerocopy(ep_map[m].host_slot,
+				&rpt_ptr, ep_map[m].maxpkt);
+			if (ret > 0 && rpt_ptr) {
+				did_work = true;
+				// Merge directly into DMA buffer — eliminates one memcpy
 				kmbox_merge_report(ep_map[m].iface_protocol,
-					report_buf, ret);
+					rpt_ptr, ret);
 				bool sent = usb_device_send_report(
-					ep_map[m].dev_ep_num, report_buf, ret);
+					ep_map[m].dev_ep_num, rpt_ptr, ret);
 				if (sent) {
 					report_count++;
 				} else {
@@ -392,6 +462,12 @@ int main(void)
 			led_off_time = 0;
 		}
 		kmbox_send_pending();
+
+		// Sleep until next event when idle — PIT ISR, USB completion,
+		// or UART DMA will set the event flag via SEVONPEND.
+		// Reduces power draw and frees bus bandwidth for DMA.
+		if (!did_work)
+			__asm volatile("wfe");
 
 #if TFT_ENABLED
 		if ((millis() - last_tft_update) >= 33) {
@@ -439,6 +515,17 @@ int main(void)
 #endif
 		}
 #endif
+		// PWM LED brightness: maps reports/sec to 0-255.
+		// ~1000 rpt/s = full brightness, 0 = off. Updated every 100ms.
+		if ((millis() - led_pwm_update) >= 100) {
+			uint32_t delta = report_count - led_report_snapshot;
+			led_report_snapshot = report_count;
+			// delta per 100ms -> rpt/s = delta * 10, map to 0-255
+			uint32_t brightness = delta * 10 * 255 / 1000;
+			if (brightness > 255) brightness = 255;
+			led_pwm_set((uint8_t)brightness);
+			led_pwm_update = millis();
+		}
 		if ((++loop_count & 0x3FF) == 0) {
 			if (!usb_host_device_connected()) {
 				uart_puts("Mouse disconnected!\r\n");

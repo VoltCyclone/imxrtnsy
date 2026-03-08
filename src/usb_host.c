@@ -435,10 +435,25 @@ int usb_host_interrupt_poll(uint8_t index, uint8_t *data, uint16_t len)
 	intr_transfer_active[index] = false;
 
 	if (token & QTD_TOKEN_HALTED) {
+		// Re-prime immediately instead of wasting a poll cycle
 		intr_halt_count[index]++;
-		qh->token = token & QTD_TOKEN_TOGGLE;
-		qh->next = QTD_TERMINATE;
+		uint32_t toggle = token & QTD_TOKEN_TOGGLE;
+		qh->next     = QTD_TERMINATE;
+		qh->alt_next = QTD_TERMINATE;
+		qh->token    = toggle | QTD_TOKEN_ACTIVE | QTD_TOKEN_PID_IN |
+			QTD_TOKEN_NBYTES(len) | QTD_TOKEN_CERR(3) | QTD_TOKEN_IOC;
+		{
+			uint32_t a = (uint32_t)buf;
+			qh->buffer[0] = a;
+			a &= 0xFFFFF000;
+			qh->buffer[1] = a + 0x1000;
+			qh->buffer[2] = a + 0x2000;
+			qh->buffer[3] = a + 0x3000;
+			qh->buffer[4] = a + 0x4000;
+		}
 		asm volatile("dsb" ::: "memory");
+		intr_transfer_active[index] = true;
+		intr_prime_time[index] = millis();
 		return 0;
 	}
 
@@ -454,5 +469,87 @@ int usb_host_interrupt_poll(uint8_t index, uint8_t *data, uint16_t len)
 	if (transferred > 0) {
 		memcpy(data, buf, transferred);
 	}
+	return (int)transferred;
+}
+
+int usb_host_interrupt_poll_zerocopy(uint8_t index, uint8_t **data_ptr, uint16_t len)
+{
+	if (index >= MAX_INTR_EPS || !intr_initialized[index]) return -1;
+
+	ehci_qh_t *qh  = &qh_intr[index];
+	uint8_t   *buf = intr_buf[index];
+
+	if (!intr_transfer_active[index]) {
+		uint32_t toggle = qh->token & QTD_TOKEN_TOGGLE;
+		qh->next     = QTD_TERMINATE;
+		qh->alt_next = QTD_TERMINATE;
+		qh->token    = toggle | QTD_TOKEN_ACTIVE | QTD_TOKEN_PID_IN |
+			QTD_TOKEN_NBYTES(len) | QTD_TOKEN_CERR(3) | QTD_TOKEN_IOC;
+		{
+			uint32_t a = (uint32_t)buf;
+			qh->buffer[0] = a;
+			a &= 0xFFFFF000;
+			qh->buffer[1] = a + 0x1000;
+			qh->buffer[2] = a + 0x2000;
+			qh->buffer[3] = a + 0x3000;
+			qh->buffer[4] = a + 0x4000;
+		}
+		asm volatile("dsb" ::: "memory");
+		intr_transfer_active[index] = true;
+		intr_prime_time[index] = millis();
+		return 0;
+	}
+
+	uint32_t token = qh->token;
+
+	if (token & QTD_TOKEN_ACTIVE) {
+		if ((millis() - intr_prime_time[index]) > 100) {
+			qh->token = token & QTD_TOKEN_TOGGLE;
+			qh->next = QTD_TERMINATE;
+			asm volatile("dsb" ::: "memory");
+			intr_transfer_active[index] = false;
+			intr_timeout_count[index]++;
+			return -1;
+		}
+		return 0;
+	}
+
+	intr_transfer_active[index] = false;
+
+	if (token & QTD_TOKEN_HALTED) {
+		// Re-prime immediately instead of wasting a poll cycle
+		intr_halt_count[index]++;
+		uint32_t toggle = token & QTD_TOKEN_TOGGLE;
+		qh->next     = QTD_TERMINATE;
+		qh->alt_next = QTD_TERMINATE;
+		qh->token    = toggle | QTD_TOKEN_ACTIVE | QTD_TOKEN_PID_IN |
+			QTD_TOKEN_NBYTES(len) | QTD_TOKEN_CERR(3) | QTD_TOKEN_IOC;
+		{
+			uint32_t a = (uint32_t)buf;
+			qh->buffer[0] = a;
+			a &= 0xFFFFF000;
+			qh->buffer[1] = a + 0x1000;
+			qh->buffer[2] = a + 0x2000;
+			qh->buffer[3] = a + 0x3000;
+			qh->buffer[4] = a + 0x4000;
+		}
+		asm volatile("dsb" ::: "memory");
+		intr_transfer_active[index] = true;
+		intr_prime_time[index] = millis();
+		return 0;
+	}
+
+	if (token & (QTD_TOKEN_BUFERR | QTD_TOKEN_BABBLE | QTD_TOKEN_XACTERR)) {
+		intr_error_count[index]++;
+		qh->token = token & QTD_TOKEN_TOGGLE;
+		qh->next = QTD_TERMINATE;
+		asm volatile("dsb" ::: "memory");
+		return -1;
+	}
+
+	uint32_t remaining = (token >> 16) & 0x7FFF;
+	uint32_t transferred = len - remaining;
+	if (transferred > 0)
+		*data_ptr = buf; // return pointer directly into DMA buffer
 	return (int)transferred;
 }

@@ -12,6 +12,38 @@ Plugs in between a USB device and a host PC. Captures the device's descriptors o
 
 The VBUS power switch is on GPIO_EMC_40 (GPIO8 bit 26).
 
+## Display Wiring
+
+An optional TFT display can show live status. Two drivers are supported, selectable at build time with `TFT_DRIVER=1` (ST7735, default) or `TFT_DRIVER=3` (ILI9341).
+
+Both displays share the same SPI bus (LPSPI4) and control pins:
+
+| Signal | Teensy Pin | Notes                    |
+|--------|------------|--------------------------|
+| SCK    | 13         | SPI clock                |
+| MOSI   | 11         | SPI data                 |
+| CS     | 10         | Chip select (active low) |
+| DC     | 9          | Data/command select      |
+| RST    | 6          | Reset (active low)       |
+| BL     | —          | Backlight (GPIO7 bit 17) |
+
+### Optional: FT6206 Touch (ILI9341 only)
+
+If using an ILI9341 with a capacitive touch panel, enable with `TOUCH=1`:
+
+| Signal | Teensy Pin | Notes     |
+|--------|------------|-----------|
+| SDA    | 18         | I2C data  |
+| SCL    | 19         | I2C clock |
+
+### Build examples
+
+```
+make TFT=1 -j4                          # ST7735, no touch (default)
+make TFT=1 TFT_DRIVER=3 TOUCH=1 -j4    # ILI9341 with touch
+make TFT=0 -j4                          # no display
+```
+
 ## Building
 
 Requires the ARM GCC toolchain. The Makefile expects it at the PlatformIO default path — edit `TOOLCHAIN` in the Makefile if yours is elsewhere.
