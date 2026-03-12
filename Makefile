@@ -21,11 +21,14 @@ TOUCH ?= 0
 UART_AUTOBAUD ?= 0
 # Pass NET=1 to enable Ethernet (KMBox Net UDP protocol, replaces UART commands)
 NET ?= 0
+# Pass BT=1 to use LPUART7 (Teensy pins 28/29) for Bluetooth serial instead of LPUART6
+BT ?= 0
+BT_BAUD ?= 115200
 
 DEFINES = -DARDUINO_TEENSY41 -D__IMXRT1062__ -DF_CPU=816000000 -DUART_ENABLED=$(UART) \
           -DUART_BAUD=$(UART_BAUD) -DTFT_ENABLED=$(TFT) -DTFT_DRIVER=$(TFT_DRIVER) \
           -DTOUCH_ENABLED=$(TOUCH) -DUART_AUTOBAUD=$(UART_AUTOBAUD) \
-          -DNET_ENABLED=$(NET)
+          -DNET_ENABLED=$(NET) -DBT_ENABLED=$(BT) -DBT_BAUD=$(BT_BAUD)
 
 CFLAGS = $(MCU_FLAGS) $(DEFINES) \
          -Os -Wall -Wno-unused-variable \

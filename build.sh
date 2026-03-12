@@ -116,22 +116,45 @@ if [[ "$uart_choice" -eq 2 ]]; then
     [[ "$autobaud_choice" -eq 2 ]] && UART_AUTOBAUD=1
 fi
 
-# ── Network ──────────────────────────────────────────────────────────────
+# ── Command Input ────────────────────────────────────────────────────────
 NET=0
+BT=0
+BT_BAUD=115200
 
-net_choice=$(prompt_choice "Command input:" \
-    "UART  (KMBox/Makcu/Ferrum)" \
+cmd_choice=$(prompt_choice "Command input:" \
+    "UART  (pins 0/1, KMBox/Makcu/Ferrum)" \
+    "Bluetooth (pins 28/29, HC-06)" \
     "Ethernet (KMBox Net UDP)")
 
-if [[ "$net_choice" -eq 2 ]]; then
-    NET=1
-    # NET mode requires TFT for IP/port/UUID display
-    if [[ "$TFT" -eq 0 ]]; then
-        printf "\n${YELLOW}  Note: Ethernet mode requires TFT — enabling ST7735${RESET}\n"
-        TFT=1
-        TFT_DRIVER=1
-    fi
-fi
+case "$cmd_choice" in
+    2)
+        BT=1
+        bt_baud_choice=$(prompt_choice "Bluetooth baud rate:" \
+            "115200" \
+            "9600" \
+            "921600" \
+            "Custom")
+        case "$bt_baud_choice" in
+            1) BT_BAUD=115200 ;;
+            2) BT_BAUD=9600 ;;
+            3) BT_BAUD=921600 ;;
+            4)
+                printf "${BOLD}  Baud rate> ${RESET}"
+                read -r BT_BAUD
+                BT_BAUD=${BT_BAUD:-115200}
+                ;;
+        esac
+        ;;
+    3)
+        NET=1
+        # NET mode requires TFT for IP/port/UUID display
+        if [[ "$TFT" -eq 0 ]]; then
+            printf "\n${YELLOW}  Note: Ethernet mode requires TFT — enabling ST7735${RESET}\n"
+            TFT=1
+            TFT_DRIVER=1
+        fi
+        ;;
+esac
 
 # ── Build Options ───────────────────────────────────────────────────────────
 CLEAN=false
@@ -176,9 +199,11 @@ else
 fi
 
 if [[ "$NET" -eq 1 ]]; then
-    printf "  │  Network:    ${GREEN}%-25s${RESET} │\n" "KMBox Net (Ethernet)"
+    printf "  │  Cmd input:  ${GREEN}%-25s${RESET} │\n" "Ethernet (KMBox Net)"
+elif [[ "$BT" -eq 1 ]]; then
+    printf "  │  Cmd input:  ${GREEN}%-25s${RESET} │\n" "Bluetooth @ ${BT_BAUD}"
 else
-    printf "  │  Network:    ${DIM}%-25s${RESET} │\n" "Disabled"
+    printf "  │  Cmd input:  ${GREEN}%-25s${RESET} │\n" "UART (pins 0/1)"
 fi
 
 $CLEAN && cl="Yes" || cl="No"
@@ -206,6 +231,8 @@ MAKE_ARGS=(
     "UART_BAUD=${UART_BAUD}"
     "UART_AUTOBAUD=${UART_AUTOBAUD}"
     "NET=${NET}"
+    "BT=${BT}"
+    "BT_BAUD=${BT_BAUD}"
     "-j${PARALLEL}"
 )
 

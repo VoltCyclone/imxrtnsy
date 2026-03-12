@@ -1,4 +1,4 @@
-// Multi-protocol command injection over LPUART6
+// Multi-protocol command injection over UART (LPUART7 when BT_ENABLED, else LPUART6)
 // Auto-detects and handles three protocols on the same UART:
 //   - KMBox B binary: sync 0x57 0xAB, cmd, len, payload, checksum
 //   - Makcu binary:   sync 0x50, cmd, len_lo, len_hi, payload
@@ -23,13 +23,97 @@ extern uint32_t millis(void);
 #endif
 #define UART_CLOCK 24000000
 
+// ---- Hardware abstraction: select LPUART peripheral and DMA channels ----
+#if BT_ENABLED
+// LPUART7 on Teensy pins 28 (RX7) / 29 (TX7) for Bluetooth serial
+#undef  UART_BAUD
+#define UART_BAUD          BT_BAUD
+
+#define KM_UART_BAUD       LPUART7_BAUD
+#define KM_UART_CTRL       LPUART7_CTRL
+#define KM_UART_STAT       LPUART7_STAT
+#define KM_UART_DATA       LPUART7_DATA
+#define KM_UART_FIFO       LPUART7_FIFO
+#define KM_UART_WATER      LPUART7_WATER
+
+#define KM_RX_SADDR        DMA_TCD3_SADDR
+#define KM_RX_SOFF         DMA_TCD3_SOFF
+#define KM_RX_ATTR         DMA_TCD3_ATTR
+#define KM_RX_NBYTES       DMA_TCD3_NBYTES_MLNO
+#define KM_RX_SLAST        DMA_TCD3_SLAST
+#define KM_RX_DADDR        DMA_TCD3_DADDR
+#define KM_RX_DOFF         DMA_TCD3_DOFF
+#define KM_RX_CITER        DMA_TCD3_CITER_ELINKNO
+#define KM_RX_BITER        DMA_TCD3_BITER_ELINKNO
+#define KM_RX_DLASTSGA     DMA_TCD3_DLASTSGA
+#define KM_RX_CSR          DMA_TCD3_CSR
+#define KM_RX_DMAMUX       DMAMUX_CHCFG3
+#define KM_RX_DMAMUX_SRC   DMAMUX_SOURCE_LPUART7_RX
+#define KM_RX_CH           3
+
+#define KM_TX_SADDR        DMA_TCD4_SADDR
+#define KM_TX_SOFF         DMA_TCD4_SOFF
+#define KM_TX_ATTR         DMA_TCD4_ATTR
+#define KM_TX_NBYTES       DMA_TCD4_NBYTES_MLNO
+#define KM_TX_SLAST        DMA_TCD4_SLAST
+#define KM_TX_DADDR        DMA_TCD4_DADDR
+#define KM_TX_DOFF         DMA_TCD4_DOFF
+#define KM_TX_CITER        DMA_TCD4_CITER_ELINKNO
+#define KM_TX_BITER        DMA_TCD4_BITER_ELINKNO
+#define KM_TX_DLASTSGA     DMA_TCD4_DLASTSGA
+#define KM_TX_CSR          DMA_TCD4_CSR
+#define KM_TX_DMAMUX       DMAMUX_CHCFG4
+#define KM_TX_DMAMUX_SRC   DMAMUX_SOURCE_LPUART7_TX
+#define KM_TX_CH           4
+
+#else
+// LPUART6 on Teensy pins 0 (RX1) / 1 (TX1) — default
+#define KM_UART_BAUD       LPUART6_BAUD
+#define KM_UART_CTRL       LPUART6_CTRL
+#define KM_UART_STAT       LPUART6_STAT
+#define KM_UART_DATA       LPUART6_DATA
+#define KM_UART_FIFO       LPUART6_FIFO
+#define KM_UART_WATER      LPUART6_WATER
+
+#define KM_RX_SADDR        DMA_TCD0_SADDR
+#define KM_RX_SOFF         DMA_TCD0_SOFF
+#define KM_RX_ATTR         DMA_TCD0_ATTR
+#define KM_RX_NBYTES       DMA_TCD0_NBYTES_MLNO
+#define KM_RX_SLAST        DMA_TCD0_SLAST
+#define KM_RX_DADDR        DMA_TCD0_DADDR
+#define KM_RX_DOFF         DMA_TCD0_DOFF
+#define KM_RX_CITER        DMA_TCD0_CITER_ELINKNO
+#define KM_RX_BITER        DMA_TCD0_BITER_ELINKNO
+#define KM_RX_DLASTSGA     DMA_TCD0_DLASTSGA
+#define KM_RX_CSR          DMA_TCD0_CSR
+#define KM_RX_DMAMUX       DMAMUX_CHCFG0
+#define KM_RX_DMAMUX_SRC   DMAMUX_SOURCE_LPUART6_RX
+#define KM_RX_CH           0
+
+#define KM_TX_SADDR        DMA_TCD2_SADDR
+#define KM_TX_SOFF         DMA_TCD2_SOFF
+#define KM_TX_ATTR         DMA_TCD2_ATTR
+#define KM_TX_NBYTES       DMA_TCD2_NBYTES_MLNO
+#define KM_TX_SLAST        DMA_TCD2_SLAST
+#define KM_TX_DADDR        DMA_TCD2_DADDR
+#define KM_TX_DOFF         DMA_TCD2_DOFF
+#define KM_TX_CITER        DMA_TCD2_CITER_ELINKNO
+#define KM_TX_BITER        DMA_TCD2_BITER_ELINKNO
+#define KM_TX_DLASTSGA     DMA_TCD2_DLASTSGA
+#define KM_TX_CSR          DMA_TCD2_CSR
+#define KM_TX_DMAMUX       DMAMUX_CHCFG2
+#define KM_TX_DMAMUX_SRC   DMAMUX_SOURCE_LPUART6_TX
+#define KM_TX_CH           2
+
+#endif
+
 // ---- eDMA RX ring buffer (non-cacheable via MPU region 10) ----
 #define DMA_RX_RING_SIZE 256
 static uint8_t dma_rx_ring[DMA_RX_RING_SIZE]
 	__attribute__((section(".dmabuffers"), aligned(DMA_RX_RING_SIZE)));
 static volatile uint16_t rx_tail;
 
-// ---- eDMA TX: staging ring -> DMA channel 2 -> LPUART6_DATA ----
+// ---- eDMA TX: staging ring -> DMA TX channel -> UART DATA ----
 // Software ring for staging; DMA copies contiguous chunks to UART hardware.
 #define TX_RING_SIZE 128
 static uint8_t tx_ring[TX_RING_SIZE];
@@ -171,10 +255,10 @@ static void tx_enqueue_str(const char *s)
 static void tx_flush(void)
 {
 	// If previous transfer still in flight, let it finish
-	if (!(DMA_TCD2_CSR & DMA_TCD_CSR_DONE) &&
-	    DMA_TCD2_CITER_ELINKNO != DMA_TCD2_BITER_ELINKNO)
+	if (!(KM_TX_CSR & DMA_TCD_CSR_DONE) &&
+	    KM_TX_CITER != KM_TX_BITER)
 		return;
-	DMA_CDNE = 2; // clear DONE flag for next transfer
+	DMA_CDNE = KM_TX_CH; // clear DONE flag for next transfer
 
 	// Copy pending ring bytes into linear DMA buffer
 	uint8_t count = 0;
@@ -185,11 +269,11 @@ static void tx_flush(void)
 	if (count == 0) return;
 
 	// Update only the 3 TCD fields that change per flush (static fields set in kmbox_init)
-	DMA_TCD2_SADDR = (volatile const void *)dma_tx_buf;
-	DMA_TCD2_CITER_ELINKNO = count;
-	DMA_TCD2_BITER_ELINKNO = count;
-	DMA_TCD2_CSR = DMA_TCD_CSR_DREQ; // auto-disable requests on completion
-	DMA_SERQ = 2; // enable channel 2 requests — DMA fires on each TDRE
+	KM_TX_SADDR = (volatile const void *)dma_tx_buf;
+	KM_TX_CITER = count;
+	KM_TX_BITER = count;
+	KM_TX_CSR = DMA_TCD_CSR_DREQ; // auto-disable requests on completion
+	DMA_SERQ = KM_TX_CH; // enable TX DMA channel requests
 }
 void kmbox_init(void)
 {
@@ -206,21 +290,31 @@ void kmbox_init(void)
 	cached_mouse_report_len = 0;
 	return;
 #endif
-	// Enable LPUART6 clock gate
+#if BT_ENABLED
+	// LPUART7: pin 29 (GPIO_AD_B1_02) = TX, pin 28 (GPIO_AD_B1_03) = RX
+	CCM_CCGR5 |= CCM_CCGR5_LPUART7(CCM_CCGR_ON);
+	IOMUXC_SW_MUX_CTL_PAD_GPIO_AD_B1_02 = 2;
+	IOMUXC_SW_PAD_CTL_PAD_GPIO_AD_B1_02 =
+		IOMUXC_PAD_DSE(6) | IOMUXC_PAD_SPEED(2);
+	IOMUXC_LPUART7_TX_SELECT_INPUT = 1;
+	IOMUXC_SW_MUX_CTL_PAD_GPIO_AD_B1_03 = 2;
+	IOMUXC_SW_PAD_CTL_PAD_GPIO_AD_B1_03 =
+		IOMUXC_PAD_DSE(6) | IOMUXC_PAD_SPEED(2) |
+		IOMUXC_PAD_PKE | IOMUXC_PAD_PUE | IOMUXC_PAD_PUS(3);
+	IOMUXC_LPUART7_RX_SELECT_INPUT = 1;
+#else
+	// LPUART6: pin 1 (GPIO_AD_B0_02) = TX, pin 0 (GPIO_AD_B0_03) = RX
 	CCM_CCGR3 |= CCM_CCGR3_LPUART6(CCM_CCGR_ON);
-
-	// Pin 1 (GPIO_AD_B0_02) = LPUART6_TX (ALT2)
 	IOMUXC_SW_MUX_CTL_PAD_GPIO_AD_B0_02 = 2;
 	IOMUXC_SW_PAD_CTL_PAD_GPIO_AD_B0_02 =
 		IOMUXC_PAD_DSE(6) | IOMUXC_PAD_SPEED(2);
 	IOMUXC_LPUART6_TX_SELECT_INPUT = 1;
-
-	// Pin 0 (GPIO_AD_B0_03) = LPUART6_RX (ALT2)
 	IOMUXC_SW_MUX_CTL_PAD_GPIO_AD_B0_03 = 2;
 	IOMUXC_SW_PAD_CTL_PAD_GPIO_AD_B0_03 =
 		IOMUXC_PAD_DSE(6) | IOMUXC_PAD_SPEED(2) |
 		IOMUXC_PAD_PKE | IOMUXC_PAD_PUE | IOMUXC_PAD_PUS(3);
 	IOMUXC_LPUART6_RX_SELECT_INPUT = 1;
+#endif
 
 	// Baud: pick OSR so SBR >= 1 (e.g. 2M @ 24MHz -> OSR=11, SBR=1)
 	uint32_t osr;
@@ -232,54 +326,54 @@ void kmbox_init(void)
 	}
 	uint32_t sbr = UART_CLOCK / (UART_BAUD * (osr + 1));
 	if (sbr == 0) sbr = 1;
-	LPUART6_BAUD = LPUART_BAUD_OSR(osr) | LPUART_BAUD_SBR(sbr);
+	KM_UART_BAUD = LPUART_BAUD_OSR(osr) | LPUART_BAUD_SBR(sbr);
 
 	// Disable TE/RE before FIFO config (required by i.MX RT datasheet).
 	// uart_init() may have already enabled them when UART_ENABLED=1.
-	LPUART6_CTRL = 0;
+	KM_UART_CTRL = 0;
 
 	// Enable 4-entry RX and TX hardware FIFOs (must be set while TE/RE clear)
-	LPUART6_FIFO = LPUART_FIFO_RXFE | LPUART_FIFO_TXFE;
-	LPUART6_FIFO |= LPUART_FIFO_TXFLUSH | LPUART_FIFO_RXFLUSH;
-	LPUART6_WATER = LPUART_WATER_RXWATER(1);
+	KM_UART_FIFO = LPUART_FIFO_RXFE | LPUART_FIFO_TXFE;
+	KM_UART_FIFO |= LPUART_FIFO_TXFLUSH | LPUART_FIFO_RXFLUSH;
+	KM_UART_WATER = LPUART_WATER_RXWATER(1);
 
-	LPUART6_CTRL = LPUART_CTRL_TE | LPUART_CTRL_RE;
+	KM_UART_CTRL = LPUART_CTRL_TE | LPUART_CTRL_RE;
 
-	// ---- eDMA channel 0: LPUART6 RX -> ring buffer ----
+	// ---- eDMA RX: UART DATA register -> ring buffer ----
 	CCM_CCGR5 |= CCM_CCGR5_DMA(CCM_CCGR_ON);
-	DMAMUX_CHCFG0 = 0; // disable before reconfiguring
-	DMA_TCD0_SADDR = (volatile const void *)&LPUART6_DATA;
-	DMA_TCD0_SOFF = 0;
-	DMA_TCD0_ATTR = DMA_TCD_ATTR_SSIZE(DMA_TCD_ATTR_SIZE_8BIT) |
-	                DMA_TCD_ATTR_DSIZE(DMA_TCD_ATTR_SIZE_8BIT);
-	DMA_TCD0_NBYTES_MLNO = 1;
-	DMA_TCD0_SLAST = 0;
-	DMA_TCD0_DADDR = (volatile void *)dma_rx_ring;
-	DMA_TCD0_DOFF = 1;
-	DMA_TCD0_CITER_ELINKNO = DMA_RX_RING_SIZE;
-	DMA_TCD0_BITER_ELINKNO = DMA_RX_RING_SIZE;
-	DMA_TCD0_DLASTSGA = -DMA_RX_RING_SIZE;
-	DMA_TCD0_CSR = 0; // no DREQ — continuous circular operation
-	DMAMUX_CHCFG0 = DMAMUX_SOURCE_LPUART6_RX | DMAMUX_CHCFG_ENBL;
-	DMA_SERQ = 0; // enable channel 0 requests
-	LPUART6_BAUD |= LPUART_BAUD_RDMAE; // route RX to DMA
+	KM_RX_DMAMUX = 0; // disable before reconfiguring
+	KM_RX_SADDR = (volatile const void *)&KM_UART_DATA;
+	KM_RX_SOFF = 0;
+	KM_RX_ATTR = DMA_TCD_ATTR_SSIZE(DMA_TCD_ATTR_SIZE_8BIT) |
+	             DMA_TCD_ATTR_DSIZE(DMA_TCD_ATTR_SIZE_8BIT);
+	KM_RX_NBYTES = 1;
+	KM_RX_SLAST = 0;
+	KM_RX_DADDR = (volatile void *)dma_rx_ring;
+	KM_RX_DOFF = 1;
+	KM_RX_CITER = DMA_RX_RING_SIZE;
+	KM_RX_BITER = DMA_RX_RING_SIZE;
+	KM_RX_DLASTSGA = -DMA_RX_RING_SIZE;
+	KM_RX_CSR = 0; // no DREQ — continuous circular operation
+	KM_RX_DMAMUX = KM_RX_DMAMUX_SRC | DMAMUX_CHCFG_ENBL;
+	DMA_SERQ = KM_RX_CH;
+	KM_UART_BAUD |= LPUART_BAUD_RDMAE; // route RX to DMA
 	rx_tail = 0;
 
-	// ---- eDMA channel 2: dma_tx_buf -> LPUART6 TX ----
+	// ---- eDMA TX: dma_tx_buf -> UART DATA register ----
 	// Pre-fill static TCD fields once; tx_flush only updates SADDR/CITER/BITER.
-	DMAMUX_CHCFG2 = 0;
-	DMA_TCD2_SADDR = (volatile const void *)dma_tx_buf;
-	DMA_TCD2_SOFF = 1;
-	DMA_TCD2_ATTR = DMA_TCD_ATTR_SSIZE(DMA_TCD_ATTR_SIZE_8BIT) |
-	                DMA_TCD_ATTR_DSIZE(DMA_TCD_ATTR_SIZE_8BIT);
-	DMA_TCD2_NBYTES_MLNO = 1;
-	DMA_TCD2_SLAST = 0;
-	DMA_TCD2_DADDR = (volatile void *)&LPUART6_DATA;
-	DMA_TCD2_DOFF = 0;
-	DMA_TCD2_DLASTSGA = 0;
-	DMA_TCD2_CSR = DMA_TCD_CSR_DONE; // mark idle so first tx_flush succeeds
-	DMAMUX_CHCFG2 = DMAMUX_SOURCE_LPUART6_TX | DMAMUX_CHCFG_ENBL;
-	LPUART6_BAUD |= LPUART_BAUD_TDMAE; // route TX FIFO ready to DMA
+	KM_TX_DMAMUX = 0;
+	KM_TX_SADDR = (volatile const void *)dma_tx_buf;
+	KM_TX_SOFF = 1;
+	KM_TX_ATTR = DMA_TCD_ATTR_SSIZE(DMA_TCD_ATTR_SIZE_8BIT) |
+	             DMA_TCD_ATTR_DSIZE(DMA_TCD_ATTR_SIZE_8BIT);
+	KM_TX_NBYTES = 1;
+	KM_TX_SLAST = 0;
+	KM_TX_DADDR = (volatile void *)&KM_UART_DATA;
+	KM_TX_DOFF = 0;
+	KM_TX_DLASTSGA = 0;
+	KM_TX_CSR = DMA_TCD_CSR_DONE; // mark idle so first tx_flush succeeds
+	KM_TX_DMAMUX = KM_TX_DMAMUX_SRC | DMAMUX_CHCFG_ENBL;
+	KM_UART_BAUD |= LPUART_BAUD_TDMAE; // route TX FIFO ready to DMA
 
 	tx_head = 0;
 	tx_tail_pos = 0;
@@ -489,9 +583,9 @@ void kmbox_poll(void)
 #endif
 	merged_this_cycle = false;
 	tx_flush();
-	uint32_t stat = LPUART6_STAT;
+	uint32_t stat = KM_UART_STAT;
 	if (__builtin_expect(stat & (LPUART_STAT_OR | LPUART_STAT_FE | LPUART_STAT_NF), 0)) {
-		LPUART6_STAT = stat & (LPUART_STAT_OR | LPUART_STAT_FE | LPUART_STAT_NF);
+		KM_UART_STAT = stat & (LPUART_STAT_OR | LPUART_STAT_FE | LPUART_STAT_NF);
 		proto_mode = PROTO_IDLE;
 		ferrum_pos = 0;
 	}
@@ -503,7 +597,7 @@ void kmbox_poll(void)
 		inject.click_release_at = 0;
 	}
 
-	uint16_t head = ((uint32_t)DMA_TCD0_DADDR - (uint32_t)dma_rx_ring) & (DMA_RX_RING_SIZE - 1);
+	uint16_t head = ((uint32_t)KM_RX_DADDR - (uint32_t)dma_rx_ring) & (DMA_RX_RING_SIZE - 1);
 	while (rx_tail != head) {
 		uint8_t b = dma_rx_ring[rx_tail];
 		rx_tail = (rx_tail + 1) & (DMA_RX_RING_SIZE - 1);
