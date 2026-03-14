@@ -31,6 +31,11 @@ typedef struct {
 	uint32_t kmbox_frames_ok;
 	uint32_t kmbox_frames_err;
 
+	// UART hardware error breakdown
+	uint32_t uart_overrun;     // OR: FIFO overrun (DMA too slow)
+	uint32_t uart_framing;     // FE: baud mismatch or signal integrity
+	uint32_t uart_noise;       // NF: electrical noise on line
+
 	// UART / KMBox RX
 	uint32_t uart_rx_bytes;    // total bytes received on LPUART6 (DMA ring)
 

@@ -37,4 +37,3 @@ typedef struct {
 } captured_descriptors_t;
 
 bool capture_descriptors(captured_descriptors_t *desc);
-void dump_descriptors(const captured_descriptors_t *desc);

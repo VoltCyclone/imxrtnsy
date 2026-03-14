@@ -8,7 +8,6 @@
 #include <string.h>
 #include "imxrt.h"
 #include "usb_host.h"
-#include "uart.h"
 
 extern uint32_t millis(void);
 extern void delay(uint32_t msec);
@@ -80,10 +79,7 @@ bool usb_host_init(void)
 			break;
 		}
 
-		if (--timeout == 0) {
-			uart_puts("  HOST: USB2 PLL timeout\r\n");
-			break;
-		}
+		if (--timeout == 0) break;
 	}
 	CCM_CCGR6 |= CCM_CCGR6_USBOH3(CCM_CCGR_ON);
 	host_led_mark(2);
@@ -96,10 +92,7 @@ bool usb_host_init(void)
 	USB2_USBCMD |= USB_USBCMD_RST;
 	timeout = timeout_loops;
 	while (USB2_USBCMD & USB_USBCMD_RST) {
-		if (--timeout == 0) {
-			uart_puts("  HOST: USB2 reset timeout\r\n");
-			break;
-		}
+		if (--timeout == 0) break;
 	}
 	host_led_mark(3);
 	USB2_USBMODE = USB_USBMODE_CM(3);
@@ -157,10 +150,7 @@ void usb_host_port_reset(void)
 	USB2_PORTSC1 = portsc & ~USB_PORTSC1_PR;
 	uint32_t timeout = millis() + 500;
 	while (!(USB2_PORTSC1 & USB_PORTSC1_PE)) {
-		if (millis() > timeout) {
-			uart_puts("  port enable timeout!\r\n");
-			return;
-		}
+		if (millis() > timeout) return;
 	}
 	portsc = USB2_PORTSC1;
 	uint32_t pspd = (portsc >> 26) & 3;

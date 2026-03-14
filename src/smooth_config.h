@@ -113,10 +113,13 @@
 
 // ---- Persistent micro-tremor ----
 // Fills zero-movement gaps between injection commands with Brownian-like
-// micro-movements. Prevents bimodal interval distribution (the primary
-// synthetic signature). Mean-reverting to prevent drift.
+// micro-movements during active injection. Mean-reverting to prevent drift.
+// Only active for IDLE_TIMEOUT frames after the last injection queue activity;
+// once expired, tremor and sub-pixel accumulator are zeroed to prevent
+// phantom cursor drift when the system is truly idle.
 #define SMOOTH_TREMOR_STEP           0.30f   // px, random walk step per frame
 #define SMOOTH_TREMOR_DECAY          0.88f   // mean-reversion factor
+#define SMOOTH_TREMOR_IDLE_TIMEOUT   100     // frames after last injection to keep tremor alive
 
 // ---- Dithered rounding ----
 // Varies sub-pixel rounding threshold ±RANGE around 0.5 to break up

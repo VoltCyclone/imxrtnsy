@@ -7,28 +7,21 @@ TARGET  = firmware
 
 MCU_FLAGS = -mcpu=cortex-m7 -mfpu=fpv5-d16 -mfloat-abi=hard -mthumb
 
-# Pass UART=1 on command line to enable debug UART output (e.g. make UART=1)
-UART ?= 0
-# Override UART baud rate (e.g. make UART_BAUD=921600)
-UART_BAUD ?= 2000000
 # Pass TFT=1 to enable TFT display (e.g. make TFT=1)
 TFT ?= 1
 # TFT driver: 1=ST7735 (128x160), 3=ILI9341 (240x320)
-TFT_DRIVER ?= 1
+TFT_DRIVER ?= 3
 # Pass TOUCH=1 to enable FT6206 capacitive touch (requires TFT_DRIVER=3)
-TOUCH ?= 0
-# Pass UART_AUTOBAUD=1 to detect baud from incoming RX data at boot
-UART_AUTOBAUD ?= 0
+TOUCH ?= 1
 # Pass NET=1 to enable Ethernet (KMBox Net UDP protocol, replaces UART commands)
 NET ?= 0
-# Pass BT=1 to use LPUART7 (Teensy pins 28/29) for Bluetooth serial instead of LPUART6
-BT ?= 0
-BT_BAUD ?= 115200
+# Command UART baud rate — LPUART6 on Teensy pins 0/1
+CMD_BAUD ?= 4000000
 
-DEFINES = -DARDUINO_TEENSY41 -D__IMXRT1062__ -DF_CPU=816000000 -DUART_ENABLED=$(UART) \
-          -DUART_BAUD=$(UART_BAUD) -DTFT_ENABLED=$(TFT) -DTFT_DRIVER=$(TFT_DRIVER) \
-          -DTOUCH_ENABLED=$(TOUCH) -DUART_AUTOBAUD=$(UART_AUTOBAUD) \
-          -DNET_ENABLED=$(NET) -DBT_ENABLED=$(BT) -DBT_BAUD=$(BT_BAUD)
+DEFINES = -DARDUINO_TEENSY41 -D__IMXRT1062__ -DF_CPU=816000000 \
+          -DTFT_ENABLED=$(TFT) -DTFT_DRIVER=$(TFT_DRIVER) \
+          -DTOUCH_ENABLED=$(TOUCH) \
+          -DNET_ENABLED=$(NET) -DCMD_BAUD=$(CMD_BAUD)
 
 CFLAGS = $(MCU_FLAGS) $(DEFINES) \
          -Os -Wall -Wno-unused-variable \
@@ -41,7 +34,7 @@ LDFLAGS = $(MCU_FLAGS) \
           --specs=nano.specs --specs=nosys.specs
 
 CORE_SRC = core/startup.c core/bootdata.c
-SRC      = src/main.c src/uart.c src/usb_host.c src/usb_device.c src/desc_capture.c \
+SRC      = src/main.c src/usb_host.c src/usb_device.c src/desc_capture.c \
            src/kmbox.c src/humanize.c src/smooth.c src/ferrum.c src/makcu.c \
            src/tft.c src/tft_display.c src/st7735.c src/ili9341.c src/ft6206.c \
            src/font6x8.c \

@@ -1,6 +1,6 @@
 # UART Bridge for Seeed XIAO RP2350
 # USB CDC <-> UART passthrough with NeoPixel status
-# Bridges PC to Teensy 4.1 LPUART6 (KMBox command port)
+# Bridges PC to Teensy 4.1 LPUART6 pins 0/1 (command port)
 
 cmake_minimum_required(VERSION 3.13)
 
@@ -33,10 +33,12 @@ pico_generate_pio_header(uart_bridge
 
 target_link_libraries(uart_bridge
     pico_stdlib
+    pico_status_led
     hardware_uart
     hardware_pio
     hardware_dma
     hardware_clocks
+    hardware_vreg
 )
 
 # USB CDC via pico_stdlib stdio (handles all TinyUSB descriptors)

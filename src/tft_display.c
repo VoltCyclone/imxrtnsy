@@ -152,10 +152,31 @@ static void draw_stats(const tft_proxy_stats_t *s)
 		tft_draw_string(COL(16), LINE(9), COL_RED, buf);
 	}
 
-	draw_separator(LINE(10));
+	// Line 10: UART hardware error breakdown (only if errors present)
+	{
+		uint32_t hw_total = s->uart_overrun + s->uart_framing + s->uart_noise;
+		if (hw_total > 0) {
+			tft_draw_string(COL(0), LINE(10), COL_GRAY, "OR:");
+			p = buf; p = u32_to_str(p, s->uart_overrun); fmt_done(buf, p);
+			tft_draw_string(COL(3), LINE(10),
+				s->uart_overrun > 0 ? COL_RED : COL_DARK, buf);
 
-	// Line 11: Smooth injection
-	tft_draw_string(COL(0), LINE(11), COL_GRAY, "Smooth:");
+			tft_draw_string(COL(8), LINE(10), COL_GRAY, "FE:");
+			p = buf; p = u32_to_str(p, s->uart_framing); fmt_done(buf, p);
+			tft_draw_string(COL(11), LINE(10),
+				s->uart_framing > 0 ? COL_RED : COL_DARK, buf);
+
+			tft_draw_string(COL(16), LINE(10), COL_GRAY, "NF:");
+			p = buf; p = u32_to_str(p, s->uart_noise); fmt_done(buf, p);
+			tft_draw_string(COL(19), LINE(10),
+				s->uart_noise > 0 ? COL_YELLOW : COL_DARK, buf);
+		}
+	}
+
+	draw_separator(LINE(11));
+
+	// Line 12: Smooth injection
+	tft_draw_string(COL(0), LINE(12), COL_GRAY, "Smooth:");
 	if (s->smooth_active) {
 		uint8_t filled = 0;
 		if (s->smooth_queue_max > 0)
@@ -167,86 +188,85 @@ static void draw_stats(const tft_proxy_stats_t *s)
 		p = buf + 10;
 		p = u32_to_str(p, s->smooth_queue_depth);
 		fmt_done(buf, p);
-		tft_draw_string(COL(7), LINE(11), COL_YELLOW, buf);
+		tft_draw_string(COL(7), LINE(12), COL_YELLOW, buf);
 	} else {
-		tft_draw_string(COL(7), LINE(11), COL_DARK, "idle");
+		tft_draw_string(COL(7), LINE(12), COL_DARK, "idle");
 	}
 
-	draw_separator(LINE(12));
+	draw_separator(LINE(13));
 
 #if NET_ENABLED
-	// Lines 13-16: Network stats
+	// Lines 14-17: Network stats
 	{
-		// IP address: x.x.x.x
 		uint32_t ip = s->net_ip;
-		tft_draw_string(COL(0), LINE(13), COL_GRAY, "IP:");
+		tft_draw_string(COL(0), LINE(14), COL_GRAY, "IP:");
 		p = buf;
 		p = u32_to_str(p, (ip >> 24) & 0xFF); *p++ = '.';
 		p = u32_to_str(p, (ip >> 16) & 0xFF); *p++ = '.';
 		p = u32_to_str(p, (ip >> 8) & 0xFF);  *p++ = '.';
 		p = u32_to_str(p, ip & 0xFF);
 		fmt_done(buf, p);
-		tft_draw_string(COL(3), LINE(13), COL_WHITE, buf);
+		tft_draw_string(COL(3), LINE(14), COL_WHITE, buf);
 	}
 
-	tft_draw_string(COL(0), LINE(14), COL_GRAY, "Port:");
+	tft_draw_string(COL(0), LINE(15), COL_GRAY, "Port:");
 	p = buf;
 	p = u32_to_str(p, s->net_port);
 	fmt_done(buf, p);
-	tft_draw_string(COL(5), LINE(14), COL_WHITE, buf);
+	tft_draw_string(COL(5), LINE(15), COL_WHITE, buf);
 
-	tft_draw_string(COL(11), LINE(14), COL_GRAY, "Link:");
-	tft_draw_string(COL(16), LINE(14),
+	tft_draw_string(COL(11), LINE(15), COL_GRAY, "Link:");
+	tft_draw_string(COL(16), LINE(15),
 		s->net_link_up ? COL_GREEN : COL_RED,
 		s->net_link_up ? "UP" : "DN");
 
 	{
-		tft_draw_string(COL(0), LINE(15), COL_GRAY, "UUID:");
+		tft_draw_string(COL(0), LINE(16), COL_GRAY, "UUID:");
 		p = buf;
 		p = u16_to_hex4(p, (uint16_t)(s->net_uuid >> 16));
 		p = u16_to_hex4(p, (uint16_t)(s->net_uuid & 0xFFFF));
 		fmt_done(buf, p);
-		tft_draw_string(COL(5), LINE(15), COL_CYAN, buf);
+		tft_draw_string(COL(5), LINE(16), COL_CYAN, buf);
 
-		tft_draw_string(COL(14), LINE(15),
+		tft_draw_string(COL(14), LINE(16),
 			s->net_connected ? COL_GREEN : COL_DARK,
 			s->net_connected ? "CONN" : "WAIT");
 	}
 
-	tft_draw_string(COL(0), LINE(16), COL_GRAY, "RX:");
+	tft_draw_string(COL(0), LINE(17), COL_GRAY, "RX:");
 	p = buf;
 	p = u32_to_str(p, s->net_rx_count);
 	fmt_done(buf, p);
-	tft_draw_string(COL(3), LINE(16), COL_WHITE, buf);
+	tft_draw_string(COL(3), LINE(17), COL_WHITE, buf);
 
-	tft_draw_string(COL(11), LINE(16), COL_GRAY, "TX:");
+	tft_draw_string(COL(11), LINE(17), COL_GRAY, "TX:");
 	p = buf;
 	p = u32_to_str(p, s->net_tx_count);
 	fmt_done(buf, p);
-	tft_draw_string(COL(14), LINE(16), COL_WHITE, buf);
+	tft_draw_string(COL(14), LINE(17), COL_WHITE, buf);
 
-	draw_separator(LINE(17));
+	draw_separator(LINE(18));
 #else
-	// Line 13: UART RX activity
-	tft_draw_string(COL(0), LINE(13), COL_GRAY, "UART RX:");
+	// Line 14: UART RX activity
+	tft_draw_string(COL(0), LINE(14), COL_GRAY, "UART RX:");
 	if (s->uart_rx_bytes > 0) {
 		p = buf;
 		p = u32_to_str(p, s->uart_rx_bytes);
 		*p++ = 'B';
 		fmt_done(buf, p);
-		tft_draw_string(COL(9), LINE(13), COL_GREEN, buf);
+		tft_draw_string(COL(9), LINE(14), COL_GREEN, buf);
 	} else {
-		tft_draw_string(COL(9), LINE(13), COL_RED, "no data");
+		tft_draw_string(COL(9), LINE(14), COL_RED, "no data");
 	}
 
-	draw_separator(LINE(14));
+	draw_separator(LINE(15));
 #endif
 
 	// Line offsets depend on whether NET stats took extra rows
 #if NET_ENABLED
-#define UPTIME_LINE  18
+#define UPTIME_LINE  19
 #else
-#define UPTIME_LINE  15
+#define UPTIME_LINE  16
 #endif
 
 	{
@@ -275,20 +295,20 @@ static void draw_stats(const tft_proxy_stats_t *s)
 	}
 
 #if !NET_ENABLED
-	draw_separator(LINE(16));
+	draw_separator(LINE(17));
 
 	{
-		tft_draw_string(COL(0), LINE(17), COL_GRAY, "USB:");
+		tft_draw_string(COL(0), LINE(18), COL_GRAY, "USB:");
 		p = buf;
 		p = u16_to_hex4(p, s->usb_vid);
 		*p++ = ':';
 		p = u16_to_hex4(p, s->usb_pid);
 		fmt_done(buf, p);
-		tft_draw_string(COL(4), LINE(17), COL_WHITE, buf);
+		tft_draw_string(COL(4), LINE(18), COL_WHITE, buf);
 	}
 
 	if (s->usb_product[0]) {
-		tft_draw_string(COL(0), LINE(18), COL_DARK, s->usb_product);
+		tft_draw_string(COL(0), LINE(19), COL_DARK, s->usb_product);
 	}
 #endif
 

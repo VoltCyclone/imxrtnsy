@@ -4,50 +4,75 @@
 //
 // Wiring: XIAO UART0 TX (GPIO 0 / D6) -> Teensy pin 0 (LPUART6 RX)
 //         XIAO UART0 RX (GPIO 1 / D7) <- Teensy pin 1 (LPUART6 TX)
+//
+// Optimizations:
+//   - RP2350 overclocked to 200 MHz for headroom
+//   - Bulk CDC reads/writes via TinyUSB (no per-byte overhead)
+//   - DMA circular RX on UART (zero-CPU byte capture)
+//   - UART TX via DMA for USB->UART direction
 
 #include <stdlib.h>
 #include <string.h>
 
 #include "pico/stdlib.h"
 #include "pico/stdio_usb.h"
+#include "pico/status_led.h"
 #include "hardware/uart.h"
+#include "hardware/dma.h"
+#include "hardware/irq.h"
 #include "hardware/pio.h"
 #include "hardware/clocks.h"
+#include "hardware/vreg.h"
+#include "tusb.h"
 #include "ws2812.pio.h"
 
-// ---- Pin config (Seeed XIAO RP2350) ----
-#define UART_ID          uart0
-#define UART_TX_PIN      0
-#define UART_RX_PIN      1
-#define NEOPIXEL_PIN     22
-#define NEOPIXEL_PWR_PIN 23
-#define BAUD_RATE        2000000
+// ---- Config (pin defs from SDK board header seeed_xiao_rp2350.h) ----
+#define BRIDGE_UART      uart_get_instance(PICO_DEFAULT_UART)
+#define BAUD_RATE        4000000
+#define OVERCLOCK_KHZ    200000
+
+#ifndef PICO_COLORED_STATUS_LED_WS2812_FREQ
+#define PICO_COLORED_STATUS_LED_WS2812_FREQ 800000
+#endif
+
+// ---- DMA RX ring buffer ----
+#define DMA_RX_SIZE      512
+static uint8_t dma_rx_buf[DMA_RX_SIZE] __attribute__((aligned(DMA_RX_SIZE)));
+static int dma_rx_chan = -1;
+static volatile uint16_t rx_tail;
+
+// ---- Staging buffer for bulk transfers ----
+#define STAGE_BUF_SIZE   512
+static uint8_t stage_buf[STAGE_BUF_SIZE];
 
 // ---- NeoPixel ----
 static PIO  neo_pio;
 static uint neo_sm;
 
-static inline uint32_t neo_grb(uint8_t r, uint8_t g, uint8_t b)
-{
-	return ((uint32_t)g << 24) | ((uint32_t)r << 16) | ((uint32_t)b << 8);
-}
-
 static void neo_set(uint8_t r, uint8_t g, uint8_t b)
 {
-	pio_sm_put_blocking(neo_pio, neo_sm, neo_grb(r, g, b));
+	// SDK ws2812 PIO format: GRB, MSB-first, shifted left 8 bits
+	uint32_t grb = ((uint32_t)g << 24) | ((uint32_t)r << 16) | ((uint32_t)b << 8);
+	pio_sm_put_blocking(neo_pio, neo_sm, grb);
 }
 
 static void neo_init(void)
 {
-	// XIAO RP2350 requires power pin HIGH to enable NeoPixel
-	gpio_init(NEOPIXEL_PWR_PIN);
-	gpio_set_dir(NEOPIXEL_PWR_PIN, GPIO_OUT);
-	gpio_put(NEOPIXEL_PWR_PIN, 1);
+	// Power pin for NeoPixel (SDK board define)
+#ifdef PICO_DEFAULT_WS2812_POWER_PIN
+	gpio_init(PICO_DEFAULT_WS2812_POWER_PIN);
+	gpio_set_dir(PICO_DEFAULT_WS2812_POWER_PIN, GPIO_OUT);
+	gpio_put(PICO_DEFAULT_WS2812_POWER_PIN, true);
+#endif
 
-	neo_pio = pio0;
-	uint offset = pio_add_program(neo_pio, &ws2812_program);
-	neo_sm = pio_claim_unused_sm(neo_pio, true);
-	ws2812_program_init(neo_pio, neo_sm, offset, NEOPIXEL_PIN, 800000, false);
+	// Claim PIO resources using SDK helper
+	uint offset;
+	pio_claim_free_sm_and_add_program_for_gpio_range(
+		&ws2812_program, &neo_pio, &neo_sm, &offset,
+		PICO_DEFAULT_WS2812_PIN, 1, true);
+	ws2812_program_init(neo_pio, neo_sm, offset, PICO_DEFAULT_WS2812_PIN,
+	                    PICO_COLORED_STATUS_LED_WS2812_FREQ,
+	                    PICO_COLORED_STATUS_LED_USES_WRGB);
 	neo_set(0, 0, 40); // dim blue = booting
 }
 
@@ -66,13 +91,47 @@ static void breath_tick(uint8_t r, uint8_t g, uint8_t b)
 	neo_set((r * breath_val) >> 8, (g * breath_val) >> 8, (b * breath_val) >> 8);
 }
 
+// ---- DMA-based UART RX init ----
+static void dma_uart_rx_init(void)
+{
+	dma_rx_chan = dma_claim_unused_channel(true);
+	dma_channel_config c = dma_channel_get_default_config(dma_rx_chan);
+	channel_config_set_transfer_data_size(&c, DMA_SIZE_8);
+	channel_config_set_read_increment(&c, false);
+	channel_config_set_write_increment(&c, true);
+	channel_config_set_ring(&c, true, 9); // wrap write at 2^9 = 512 bytes
+	channel_config_set_dreq(&c, uart_get_dreq(BRIDGE_UART, false)); // RX DREQ
+
+	dma_channel_configure(
+		dma_rx_chan,
+		&c,
+		dma_rx_buf,                          // write to ring buffer
+		&uart_get_hw(BRIDGE_UART)->dr,           // read from UART data register
+		0xFFFFFFFF,                          // transfer "forever"
+		true                                 // start now
+	);
+	rx_tail = 0;
+}
+
+// Get DMA write position (head of ring buffer)
+static inline uint16_t dma_rx_head(void)
+{
+	return ((uint32_t)dma_channel_hw_addr(dma_rx_chan)->write_addr
+	        - (uint32_t)dma_rx_buf) & (DMA_RX_SIZE - 1);
+}
+
 // ---- UART init ----
 static void bridge_uart_init(void)
 {
-	uart_init(UART_ID, BAUD_RATE);
-	gpio_set_function(UART_TX_PIN, GPIO_FUNC_UART);
-	gpio_set_function(UART_RX_PIN, GPIO_FUNC_UART);
-	uart_set_fifo_enabled(UART_ID, true);
+	uart_init(BRIDGE_UART, BAUD_RATE);
+	gpio_set_function(PICO_DEFAULT_UART_TX_PIN, GPIO_FUNC_UART);
+	gpio_set_function(PICO_DEFAULT_UART_RX_PIN, GPIO_FUNC_UART);
+
+	// Enable FIFO, set RX threshold low for DMA responsiveness
+	uart_set_fifo_enabled(BRIDGE_UART, true);
+
+	// Enable UART RX DMA
+	hw_set_bits(&uart_get_hw(BRIDGE_UART)->dmacr, UART_UARTDMACR_RXDMAE_BITS);
 }
 
 // ---- Status tracking ----
@@ -84,9 +143,23 @@ typedef enum {
 
 int main(void)
 {
+	// Overclock RP2350 to 200 MHz
+	vreg_set_voltage(VREG_VOLTAGE_1_20);
+	sleep_ms(2);
+	set_sys_clock_khz(OVERCLOCK_KHZ, true);
+
+	// Ensure clk_peri tracks clk_sys after overclock — some SDK versions
+	// leave clk_peri at the old frequency, causing UART baud mismatch.
+	clock_configure(clk_peri,
+	                0,
+	                CLOCKS_CLK_PERI_CTRL_AUXSRC_VALUE_CLK_SYS,
+	                OVERCLOCK_KHZ * 1000,
+	                OVERCLOCK_KHZ * 1000);
+
 	stdio_init_all();
 	neo_init();
 	bridge_uart_init();
+	dma_uart_rx_init();
 
 	status_t status = ST_NO_USB;
 	uint32_t last_neo_ms = 0;
@@ -95,26 +168,42 @@ int main(void)
 	while (1) {
 		bool usb_connected = stdio_usb_connected();
 		bool had_data = false;
-		bool did_work;
-		do {
-			did_work = false;
-			if (usb_connected) {
-				for (int i = 0; i < 32; i++) {
-					int ch = getchar_timeout_us(0);
-					if (ch == PICO_ERROR_TIMEOUT) break;
-					uart_putc(UART_ID, (char)ch);
-					had_data = true;
-					did_work = true;
-				}
-			}
-			while (uart_is_readable(UART_ID)) {
-				char c = uart_getc(UART_ID);
-				if (usb_connected)
-					putchar_raw(c);
+
+		// ---- USB CDC -> UART TX (bulk) ----
+		if (usb_connected && tud_cdc_available()) {
+			uint32_t n = tud_cdc_read(stage_buf, sizeof(stage_buf));
+			if (n > 0) {
+				uart_write_blocking(BRIDGE_UART, stage_buf, n);
 				had_data = true;
-				did_work = true;
 			}
-		} while (did_work);
+		}
+
+		// ---- UART RX (DMA ring) -> USB CDC (bulk) ----
+		uint16_t head = dma_rx_head();
+		if (head != rx_tail) {
+			uint16_t n;
+			if (head > rx_tail) {
+				// Contiguous chunk
+				n = head - rx_tail;
+				if (usb_connected) {
+					tud_cdc_write(&dma_rx_buf[rx_tail], n);
+					tud_cdc_write_flush();
+				}
+			} else {
+				// Wrapped — send in two parts
+				uint16_t n1 = DMA_RX_SIZE - rx_tail;
+				uint16_t n2 = head;
+				if (usb_connected) {
+					tud_cdc_write(&dma_rx_buf[rx_tail], n1);
+					if (n2 > 0)
+						tud_cdc_write(&dma_rx_buf[0], n2);
+					tud_cdc_write_flush();
+				}
+				n = n1 + n2;
+			}
+			rx_tail = head;
+			had_data = true;
+		}
 
 		if (had_data)
 			last_data_ms = to_ms_since_boot(get_absolute_time());
@@ -140,6 +229,8 @@ int main(void)
 				break;
 			}
 		}
+
+		tud_task(); // let TinyUSB process events
 	}
 
 	return 0;

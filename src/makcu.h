@@ -53,6 +53,8 @@ typedef struct {
 	uint8_t  kb_modifier;
 	uint8_t  kb_keys[6];
 	bool     has_keyboard;
+	bool     kb_click_release; // true = schedule key release after sending press
+	uint8_t  kb_release_key;   // key to release
 
 	bool     needs_response;  // true = send [0x50][cmd][len][status] back
 	uint8_t  resp_cmd;

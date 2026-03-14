@@ -60,13 +60,13 @@ printf "  ${DIM}Teensy 4.1 (i.MX RT1062) firmware${RESET}\n"
 
 # ── TFT Display ─────────────────────────────────────────────────────────────
 tft_choice=$(prompt_choice "TFT Display:" \
-    "ST7735  (128x160)" \
     "ILI9341 (240x320)" \
+    "ST7735  (128x160)" \
     "Disabled")
 
 case "$tft_choice" in
-    1) TFT=1; TFT_DRIVER=1 ;;
-    2) TFT=1; TFT_DRIVER=3 ;;
+    1) TFT=1; TFT_DRIVER=3 ;;
+    2) TFT=1; TFT_DRIVER=1 ;;
     3) TFT=0; TFT_DRIVER=1 ;;
 esac
 
@@ -81,71 +81,34 @@ elif [[ "$TFT" -eq 1 ]]; then
     printf "\n${DIM}  Touch skipped (requires ILI9341)${RESET}\n"
 fi
 
-# ── UART ────────────────────────────────────────────────────────────────────
-UART=0
-UART_BAUD=2000000
-UART_AUTOBAUD=0
-
-uart_choice=$(prompt_choice "UART debug output:" \
-    "Disabled" \
-    "Enabled")
-
-if [[ "$uart_choice" -eq 2 ]]; then
-    UART=1
-
-    baud_choice=$(prompt_choice "Baud rate:" \
-        "2000000" \
-        "921600" \
-        "115200" \
-        "Custom")
-
-    case "$baud_choice" in
-        1) UART_BAUD=2000000 ;;
-        2) UART_BAUD=921600 ;;
-        3) UART_BAUD=115200 ;;
-        4)
-            printf "${BOLD}  Baud rate> ${RESET}"
-            read -r UART_BAUD
-            UART_BAUD=${UART_BAUD:-2000000}
-            ;;
-    esac
-
-    autobaud_choice=$(prompt_choice "UART autobaud detection:" \
-        "Disabled" \
-        "Enabled")
-    [[ "$autobaud_choice" -eq 2 ]] && UART_AUTOBAUD=1
-fi
-
 # ── Command Input ────────────────────────────────────────────────────────
+# LPUART6 (pins 0/1) — command UART to host bridge.
 NET=0
-BT=0
-BT_BAUD=115200
+CMD_BAUD=4000000
 
 cmd_choice=$(prompt_choice "Command input:" \
-    "UART  (pins 0/1, KMBox/Makcu/Ferrum)" \
-    "Bluetooth (pins 28/29, HC-06)" \
+    "Serial (pins 0/1, LPUART6)" \
     "Ethernet (KMBox Net UDP)")
 
 case "$cmd_choice" in
-    2)
-        BT=1
-        bt_baud_choice=$(prompt_choice "Bluetooth baud rate:" \
-            "115200" \
-            "9600" \
+    1)
+        cmd_baud_choice=$(prompt_choice "Command UART baud rate:" \
+            "4000000" \
+            "2000000" \
             "921600" \
             "Custom")
-        case "$bt_baud_choice" in
-            1) BT_BAUD=115200 ;;
-            2) BT_BAUD=9600 ;;
-            3) BT_BAUD=921600 ;;
+        case "$cmd_baud_choice" in
+            1) CMD_BAUD=4000000 ;;
+            2) CMD_BAUD=2000000 ;;
+            3) CMD_BAUD=921600 ;;
             4)
                 printf "${BOLD}  Baud rate> ${RESET}"
-                read -r BT_BAUD
-                BT_BAUD=${BT_BAUD:-115200}
+                read -r CMD_BAUD
+                CMD_BAUD=${CMD_BAUD:-4000000}
                 ;;
         esac
         ;;
-    3)
+    2)
         NET=1
         # NET mode requires TFT for IP/port/UUID display
         if [[ "$TFT" -eq 0 ]]; then
@@ -190,20 +153,10 @@ else
     printf "  │  Touch:      ${DIM}%-25s${RESET} │\n" "Disabled"
 fi
 
-if [[ "$UART" -eq 1 ]]; then
-    uart_label="${UART_BAUD}"
-    [[ "$UART_AUTOBAUD" -eq 1 ]] && uart_label="${uart_label} (autobaud)"
-    printf "  │  UART:       ${GREEN}%-25s${RESET} │\n" "$uart_label"
-else
-    printf "  │  UART:       ${DIM}%-25s${RESET} │\n" "Disabled"
-fi
-
 if [[ "$NET" -eq 1 ]]; then
     printf "  │  Cmd input:  ${GREEN}%-25s${RESET} │\n" "Ethernet (KMBox Net)"
-elif [[ "$BT" -eq 1 ]]; then
-    printf "  │  Cmd input:  ${GREEN}%-25s${RESET} │\n" "Bluetooth @ ${BT_BAUD}"
 else
-    printf "  │  Cmd input:  ${GREEN}%-25s${RESET} │\n" "UART (pins 0/1)"
+    printf "  │  Cmd input:  ${GREEN}%-25s${RESET} │\n" "LPUART6 @ ${CMD_BAUD}"
 fi
 
 $CLEAN && cl="Yes" || cl="No"
@@ -227,12 +180,8 @@ MAKE_ARGS=(
     "TFT=${TFT}"
     "TFT_DRIVER=${TFT_DRIVER}"
     "TOUCH=${TOUCH}"
-    "UART=${UART}"
-    "UART_BAUD=${UART_BAUD}"
-    "UART_AUTOBAUD=${UART_AUTOBAUD}"
     "NET=${NET}"
-    "BT=${BT}"
-    "BT_BAUD=${BT_BAUD}"
+    "CMD_BAUD=${CMD_BAUD}"
     "-j${PARALLEL}"
 )
 

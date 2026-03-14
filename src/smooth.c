@@ -124,6 +124,7 @@ static struct {
 	// Persistent micro-tremor (fills gaps between commands)
 	float   tremor_x;
 	float   tremor_y;
+	uint32_t idle_frames;        // frames since last queue activity
 
 	// Timing humanization state
 	uint8_t consec_skips;        // consecutive skips so far
@@ -360,6 +361,8 @@ void smooth_inject(int16_t x, int16_t y)
 {
 	if (x == 0 && y == 0) return;
 
+	state.idle_frames = 0;
+
 	if (state.free_mask == 0) {
 		state.x_accum_fp += int_to_fp(x);
 		state.y_accum_fp += int_to_fp(y);
@@ -522,16 +525,32 @@ void smooth_process_frame(int16_t *out_x, int16_t *out_y)
 		state.last_noise_vy *= SMOOTH_VELOCITY_DECAY;
 	}
 
-	// Persistent micro-tremor: fills zero-movement gaps between commands
-	// with Brownian-like random walk. Mean-reverting to prevent drift.
-	// Critical for eliminating bimodal interval distribution.
-	if (!has_movement && state.humanize) {
+	// Track idle state: reset when queue has active entries, increment otherwise
+	if (has_movement) {
+		state.idle_frames = 0;
+	} else {
+		if (state.idle_frames < UINT32_MAX)
+			state.idle_frames++;
+	}
+
+	// Persistent micro-tremor: fills zero-movement gaps between injection
+	// commands with Brownian-like random walk. Only active during/shortly
+	// after injection activity to prevent phantom cursor drift when idle.
+	if (!has_movement && state.humanize
+	    && state.idle_frames < SMOOTH_TREMOR_IDLE_TIMEOUT) {
 		state.tremor_x = state.tremor_x * SMOOTH_TREMOR_DECAY
 			+ smooth_rand_uniform() * SMOOTH_TREMOR_STEP;
 		state.tremor_y = state.tremor_y * SMOOTH_TREMOR_DECAY
 			+ smooth_rand_uniform() * SMOOTH_TREMOR_STEP;
 		frame_x_fp = (int32_t)(state.tremor_x * (float)SMOOTH_FP_ONE);
 		frame_y_fp = (int32_t)(state.tremor_y * (float)SMOOTH_FP_ONE);
+	} else if (!has_movement) {
+		// Fully idle: decay tremor state and clear sub-pixel accumulator
+		// to prevent dithered rounding from producing stray 1px output
+		state.tremor_x *= SMOOTH_TREMOR_DECAY;
+		state.tremor_y *= SMOOTH_TREMOR_DECAY;
+		state.x_accum_fp = 0;
+		state.y_accum_fp = 0;
 	}
 
 	// Add frame contribution to sub-pixel accumulator

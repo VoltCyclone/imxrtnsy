@@ -6,7 +6,6 @@
 #include <stdint.h>
 #include <stddef.h>
 #include "imxrt.h"
-#include "uart.h"
 #include "usb_host.h"
 #include "usb_device.h"
 #include "desc_capture.h"
@@ -235,7 +234,6 @@ int main(void)
 	// Enable SEVONPEND so WFE wakes on any pending interrupt
 	SCB_SCR |= SCB_SCR_SEVONPEND;
 
-	uart_init();
 #if NET_ENABLED
 	kmnet_init();
 #endif
@@ -253,8 +251,6 @@ int main(void)
 	tempmon_init();
 	gpt_profile_init(); // GPT2: free-running µs counter for profiling
 
-	uart_puts("\r\n\r\nimxrtnsy: USB proxy\r\n");
-	uart_puts("Teensy 4.1 — i.MX RT1062\r\n\r\n");
 	led_on();
 
 	usb_host_init();
@@ -282,11 +278,8 @@ int main(void)
 	uint8_t speed = usb_host_device_speed();
 
 	if (!capture_descriptors(&desc)) {
-		uart_puts("\r\n=== CAPTURE FAILED ===\r\n");
 		led_blink_forever(5, 100, 100);
 	}
-
-	uart_puts("\r\n=== CAPTURE COMPLETE ===\r\n");
 
 	// Cache USB descriptor info for display
 	uint16_t usb_vid = desc_vid();
@@ -302,9 +295,7 @@ int main(void)
 	setup.wLength = 0;
 	int ret = usb_host_control_transfer(desc.dev_addr, desc.ep0_maxpkt,
 		&setup, NULL, 2000);
-	if (ret < 0) {
-		uart_puts("  SET_CONFIGURATION failed!\r\n");
-	}
+	(void)ret;
 	delay(10);
 
 	for (uint8_t i = 0; i < desc.num_ifaces; i++) {
@@ -331,10 +322,7 @@ int main(void)
 
 	for (uint8_t i = 0; i < desc.num_ifaces; i++) {
 		if (desc.ifaces[i].interrupt_ep == 0) continue;
-		if (num_ep_mappings >= MAX_INTR_EPS) {
-			uart_puts("  WARNING: too many interrupt EPs, skipping\r\n");
-			break;
-		}
+		if (num_ep_mappings >= MAX_INTR_EPS) break;
 		uint8_t slot = num_ep_mappings;
 		uint8_t ep = desc.ifaces[i].interrupt_ep & 0x0F;
 
@@ -400,11 +388,6 @@ int main(void)
 #if TOUCH_ENABLED
 	ft6206_init();
 #endif
-	uart_puts("\r\n=== PROXY ACTIVE (");
-	uart_putdec(num_ep_mappings);
-	uart_puts(" endpoints) ===\r\n");
-
-	uint8_t report_buf[64];
 	uint32_t report_count = 0;
 	uint32_t drop_count = 0;
 	uint32_t loop_count = 0;
@@ -497,6 +480,9 @@ int main(void)
 				.inject_count      = 0,
 				.kmbox_frames_ok   = kmbox_frame_count(),
 				.kmbox_frames_err  = kmbox_error_count(),
+				.uart_overrun      = kmbox_uart_overrun(),
+				.uart_framing      = kmbox_uart_framing(),
+				.uart_noise        = kmbox_uart_noise(),
 				.uart_rx_bytes     = kmbox_rx_byte_count(),
 				.uptime_sec        = now / 1000,
 				.cpu_temp_c        = tempmon_read(),
@@ -540,7 +526,6 @@ int main(void)
 		}
 		if ((++loop_count & 0x3FF) == 0) {
 			if (!usb_host_device_connected()) {
-				uart_puts("Mouse disconnected!\r\n");
 				led_blink_forever(6, 80, 80);
 			}
 		}

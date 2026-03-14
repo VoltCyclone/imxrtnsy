@@ -84,6 +84,9 @@ static bool     client_connected;
 static uint32_t rx_count;
 static uint32_t tx_count;
 
+// Persistent button state (accumulated across button commands)
+static uint8_t  kmnet_buttons;
+
 // Link polling
 static uint32_t last_link_check;
 static bool     link_status;
@@ -168,7 +171,9 @@ static void handle_mouse_move(const cmd_head_t *hdr, const uint8_t *data, uint16
 	int32_t y      = rd32le_s(m + 8);
 	int32_t wheel  = (len >= 16 + 16) ? rd32le_s(m + 12) : 0;
 
-	kmbox_inject_mouse((int16_t)x, (int16_t)y, (uint8_t)button,
+	if (button != 0)
+		kmnet_buttons = (uint8_t)button;
+	kmbox_inject_mouse((int16_t)x, (int16_t)y, kmnet_buttons,
 	                   (int8_t)wheel, false);
 	send_response(hdr, NULL, 0);
 }
@@ -178,9 +183,11 @@ static void handle_mouse_button(const cmd_head_t *hdr, const uint8_t *data, uint
 {
 	if (len < 16 + 4) { send_response(hdr, NULL, 0); return; }
 	int32_t state = rd32le_s(data + 16);  // 1=press, 0=release
-	// Get current buttons, set/clear this bit
-	uint8_t buttons = state ? button_bit : 0;
-	kmbox_inject_mouse(0, 0, buttons, 0, false);
+	if (state)
+		kmnet_buttons |= button_bit;
+	else
+		kmnet_buttons &= ~button_bit;
+	kmbox_inject_mouse(0, 0, kmnet_buttons, 0, false);
 	send_response(hdr, NULL, 0);
 }
 
@@ -199,7 +206,7 @@ static void handle_mouse_automove(const cmd_head_t *hdr, const uint8_t *data, ui
 	int32_t x = rd32le_s(m + 4);
 	int32_t y = rd32le_s(m + 8);
 	// Automove uses the smooth injection path
-	kmbox_inject_mouse((int16_t)x, (int16_t)y, 0, 0, true);
+	kmbox_inject_mouse((int16_t)x, (int16_t)y, kmnet_buttons, 0, true);
 	send_response(hdr, NULL, 0);
 }
 

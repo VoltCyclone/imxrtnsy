@@ -145,17 +145,20 @@ bool ferrum_parse_line(const char *line, uint8_t len, ferrum_result_t *out)
 	}
 
 	// Button commands: km.left(state), km.right(state), etc.
+	// Supports both parenthesized km.left(1) and space-separated km.left 1
 	struct { const char *name; uint8_t nlen; uint8_t mask; } btns[] = {
-		{ "left(",   5, BTN_LEFT },
-		{ "right(",  6, BTN_RIGHT },
-		{ "middle(", 7, BTN_MIDDLE },
-		{ "side1(",  6, BTN_BACK },
-		{ "side2(",  6, BTN_FORWARD },
+		{ "left",   4, BTN_LEFT },
+		{ "right",  5, BTN_RIGHT },
+		{ "middle", 6, BTN_MIDDLE },
+		{ "side1",  5, BTN_BACK },
+		{ "side2",  5, BTN_FORWARD },
 	};
 
 	for (uint8_t i = 0; i < 5; i++) {
-		if (starts_with(p, btns[i].name)) {
+		if (starts_with(p, btns[i].name) &&
+		    (p[btns[i].nlen] == '(' || p[btns[i].nlen] == ' ')) {
 			p += btns[i].nlen;
+			skip_open(&p);
 			int32_t st;
 			if (!parse_int(&p, &st)) return false;
 

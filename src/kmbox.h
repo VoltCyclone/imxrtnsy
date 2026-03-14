@@ -38,3 +38,6 @@ void kmbox_inject_keyboard(uint8_t modifier, const uint8_t keys[6]);
 uint32_t kmbox_frame_count(void);
 uint32_t kmbox_error_count(void);
 uint32_t kmbox_rx_byte_count(void);
+uint32_t kmbox_uart_overrun(void);  // OR: FIFO overrun
+uint32_t kmbox_uart_framing(void);  // FE: baud mismatch / signal
+uint32_t kmbox_uart_noise(void);    // NF: electrical noise

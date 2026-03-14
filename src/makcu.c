@@ -180,6 +180,8 @@ bool makcu_parse_command(uint8_t cmd, const uint8_t *payload, uint16_t len,
 			out->kb_modifier = g_kb_modifier;
 			memcpy(out->kb_keys, g_kb_keys, 6);
 			out->has_keyboard = true;
+			out->kb_click_release = true;
+			out->kb_release_key = key;
 		}
 		set_ok_response(out, cmd);
 		return true;

@@ -11,7 +11,6 @@
 #include "imxrt.h"
 #include "usb_device.h"
 #include "usb_host.h"
-#include "uart.h"
 
 extern uint32_t millis(void);
 extern void delay(uint32_t msec);
@@ -149,16 +148,7 @@ static void handle_get_descriptor(const usb_setup_t *setup)
 					break;
 				}
 			}
-			if (data == NULL) {
-				uart_puts("  DEV: string idx ");
-				uart_putdec(desc_index);
-				uart_puts(" NOT FOUND (have");
-				for (uint8_t i = 0; i < cap_desc->num_strings; i++) {
-					uart_putc(' ');
-					uart_putdec(cap_desc->string_index[i]);
-				}
-				uart_puts(")\r\n");
-			}
+			if (data == NULL) { /* string not found */ }
 		}
 		break;
 
@@ -241,12 +231,7 @@ static void configure_all_interrupt_endpoints(void)
 		if (num_int_eps >= MAX_INT_EPS) break;
 
 		// Check for EP collision
-		if (ep_to_slot[ep_num] != 0xFF) {
-			uart_puts("  DEV: EP collision on EP");
-			uart_putdec(ep_num);
-			uart_puts(", skipping\r\n");
-			continue;
-		}
+		if (ep_to_slot[ep_num] != 0xFF) continue;
 
 		uint8_t slot = num_int_eps++;
 		ep_to_slot[ep_num] = slot;
@@ -414,7 +399,6 @@ static void handle_passthrough(const usb_setup_t *setup)
 		uint32_t start = millis();
 		while (usb_host_control_async_busy()) {
 			if ((millis() - start) > 200) {
-				// Timeout waiting for previous async control transfer to complete
 				ep0_stall();
 				return;
 			}

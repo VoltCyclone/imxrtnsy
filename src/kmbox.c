@@ -1,8 +1,12 @@
-// Multi-protocol command injection over UART (LPUART7 when BT_ENABLED, else LPUART6)
+// Multi-protocol command injection over UART (LPUART6 — pins 0/1)
 // Auto-detects and handles three protocols on the same UART:
 //   - KMBox B binary: sync 0x57 0xAB, cmd, len, payload, checksum
 //   - Makcu binary:   sync 0x50, cmd, len_lo, len_hi, payload
 //   - Ferrum text:    km.command(args)\n  (any printable ASCII start)
+//
+// Status LEDs on carrier board BT module footprint (unpopulated):
+//   D31 = LINK  (GPIO_EMC_37 / GPIO3[23]) — solid when receiving UART data
+//   D30 = STATE (GPIO_EMC_36 / GPIO3[22]) — toggles on valid frame dispatch
 //
 // Integrates smooth injection queue with FPU-based humanization tremor.
 // Merges injected keyboard/mouse inputs additively with real device HID reports.
@@ -19,22 +23,22 @@ extern uint32_t millis(void);
 
 // ---- UART constants ----
 #ifndef UART_BAUD
-#define UART_BAUD  2000000
+#define UART_BAUD  4000000
 #endif
 #define UART_CLOCK 24000000
 
-// ---- Hardware abstraction: select LPUART peripheral and DMA channels ----
-#if BT_ENABLED
-// LPUART7 on Teensy pins 28 (RX7) / 29 (TX7) for Bluetooth serial
+// ---- Hardware: LPUART6 on Teensy pins 0 (RX) / 1 (TX) ----
+// Pin 1 = GPIO_AD_B0_02 ALT2 = LPUART6_TX
+// Pin 0 = GPIO_AD_B0_03 ALT2 = LPUART6_RX
 #undef  UART_BAUD
-#define UART_BAUD          BT_BAUD
+#define UART_BAUD          CMD_BAUD
 
-#define KM_UART_BAUD       LPUART7_BAUD
-#define KM_UART_CTRL       LPUART7_CTRL
-#define KM_UART_STAT       LPUART7_STAT
-#define KM_UART_DATA       LPUART7_DATA
-#define KM_UART_FIFO       LPUART7_FIFO
-#define KM_UART_WATER      LPUART7_WATER
+#define KM_UART_BAUD       LPUART6_BAUD
+#define KM_UART_CTRL       LPUART6_CTRL
+#define KM_UART_STAT       LPUART6_STAT
+#define KM_UART_DATA       LPUART6_DATA
+#define KM_UART_FIFO       LPUART6_FIFO
+#define KM_UART_WATER      LPUART6_WATER
 
 #define KM_RX_SADDR        DMA_TCD3_SADDR
 #define KM_RX_SOFF         DMA_TCD3_SOFF
@@ -48,7 +52,7 @@ extern uint32_t millis(void);
 #define KM_RX_DLASTSGA     DMA_TCD3_DLASTSGA
 #define KM_RX_CSR          DMA_TCD3_CSR
 #define KM_RX_DMAMUX       DMAMUX_CHCFG3
-#define KM_RX_DMAMUX_SRC   DMAMUX_SOURCE_LPUART7_RX
+#define KM_RX_DMAMUX_SRC   DMAMUX_SOURCE_LPUART6_RX
 #define KM_RX_CH           3
 
 #define KM_TX_SADDR        DMA_TCD4_SADDR
@@ -63,49 +67,18 @@ extern uint32_t millis(void);
 #define KM_TX_DLASTSGA     DMA_TCD4_DLASTSGA
 #define KM_TX_CSR          DMA_TCD4_CSR
 #define KM_TX_DMAMUX       DMAMUX_CHCFG4
-#define KM_TX_DMAMUX_SRC   DMAMUX_SOURCE_LPUART7_TX
+#define KM_TX_DMAMUX_SRC   DMAMUX_SOURCE_LPUART6_TX
 #define KM_TX_CH           4
 
-#else
-// LPUART6 on Teensy pins 0 (RX1) / 1 (TX1) — default
-#define KM_UART_BAUD       LPUART6_BAUD
-#define KM_UART_CTRL       LPUART6_CTRL
-#define KM_UART_STAT       LPUART6_STAT
-#define KM_UART_DATA       LPUART6_DATA
-#define KM_UART_FIFO       LPUART6_FIFO
-#define KM_UART_WATER      LPUART6_WATER
+// ---- Status LEDs (carrier board BT footprint, accent LEDs) ----
+// D31 = LINK:  GPIO_EMC_37 = GPIO3[23] — toggles when UART data arriving
+// D30 = STATE: GPIO_EMC_36 = GPIO3[22] — toggles on valid frame dispatch
+// D24 = STATUS: GPIO_AD_B0_12 = GPIO1[12] — solid = UART OK, flickers on error
+#define LINK_LED_BIT   (1u << 23)
+#define STATE_LED_BIT  (1u << 22)
+#define STATUS_LED_BIT (1u << 12)
 
-#define KM_RX_SADDR        DMA_TCD0_SADDR
-#define KM_RX_SOFF         DMA_TCD0_SOFF
-#define KM_RX_ATTR         DMA_TCD0_ATTR
-#define KM_RX_NBYTES       DMA_TCD0_NBYTES_MLNO
-#define KM_RX_SLAST        DMA_TCD0_SLAST
-#define KM_RX_DADDR        DMA_TCD0_DADDR
-#define KM_RX_DOFF         DMA_TCD0_DOFF
-#define KM_RX_CITER        DMA_TCD0_CITER_ELINKNO
-#define KM_RX_BITER        DMA_TCD0_BITER_ELINKNO
-#define KM_RX_DLASTSGA     DMA_TCD0_DLASTSGA
-#define KM_RX_CSR          DMA_TCD0_CSR
-#define KM_RX_DMAMUX       DMAMUX_CHCFG0
-#define KM_RX_DMAMUX_SRC   DMAMUX_SOURCE_LPUART6_RX
-#define KM_RX_CH           0
-
-#define KM_TX_SADDR        DMA_TCD2_SADDR
-#define KM_TX_SOFF         DMA_TCD2_SOFF
-#define KM_TX_ATTR         DMA_TCD2_ATTR
-#define KM_TX_NBYTES       DMA_TCD2_NBYTES_MLNO
-#define KM_TX_SLAST        DMA_TCD2_SLAST
-#define KM_TX_DADDR        DMA_TCD2_DADDR
-#define KM_TX_DOFF         DMA_TCD2_DOFF
-#define KM_TX_CITER        DMA_TCD2_CITER_ELINKNO
-#define KM_TX_BITER        DMA_TCD2_BITER_ELINKNO
-#define KM_TX_DLASTSGA     DMA_TCD2_DLASTSGA
-#define KM_TX_CSR          DMA_TCD2_CSR
-#define KM_TX_DMAMUX       DMAMUX_CHCFG2
-#define KM_TX_DMAMUX_SRC   DMAMUX_SOURCE_LPUART6_TX
-#define KM_TX_CH           2
-
-#endif
+static uint32_t link_last_rx_time; // millis() of last RX byte (for link timeout)
 
 // ---- eDMA RX ring buffer (non-cacheable via MPU region 10) ----
 #define DMA_RX_RING_SIZE 256
@@ -165,6 +138,10 @@ typedef struct {
 	// Click auto-release: mask of buttons to release after click_release_at
 	uint8_t  click_release_mask;
 	uint32_t click_release_at; // millis() timestamp, 0 = inactive
+
+	// Keyboard press auto-release: key to release after kb_release_at
+	uint8_t  kb_release_key;
+	uint32_t kb_release_at;   // millis() timestamp, 0 = inactive
 } kmbox_inject_t;
 
 // ---- Static state ----
@@ -197,6 +174,11 @@ static uint32_t frames_ok;
 static uint32_t frames_err;
 static uint32_t rx_bytes_total;
 
+// Hardware UART error counters (diagnose signal quality vs overrun)
+static uint32_t uart_overrun_count;   // OR: DMA couldn't drain FIFO fast enough
+static uint32_t uart_framing_count;   // FE: baud mismatch or signal integrity
+static uint32_t uart_noise_count;     // NF: electrical noise on line
+
 // Cached EP info — set once at enumeration, avoids per-poll iface scanning
 static uint8_t  cached_mouse_ep;    // EP number for mouse (0 = not found)
 static uint16_t cached_mouse_maxpkt;
@@ -209,7 +191,9 @@ static struct {
 	uint8_t  x_size;        // X field size in bits (8 or 16 typically)
 	uint8_t  y_size;        // Y field size in bits
 	uint8_t  wheel_size;    // wheel field size in bits
-	uint8_t  report_id;     // 0 = no report ID byte
+	uint8_t  report_id;     // report ID that owns X (0 = no report ID byte)
+	uint8_t  y_report_id;   // report ID that owns Y
+	uint8_t  wheel_report_id; // report ID that owns wheel
 	uint8_t  data_off;      // byte offset of data start (0 or 1)
 	bool     valid;         // true if X and Y were found
 	int16_t  x_max;         // precomputed (1 << (x_size-1)) - 1
@@ -282,6 +266,9 @@ void kmbox_init(void)
 	memset(&inject, 0, sizeof(inject));
 	frames_ok = 0;
 	frames_err = 0;
+	uart_overrun_count = 0;
+	uart_framing_count = 0;
+	uart_noise_count = 0;
 	cached_mouse_ep = 0;
 	cached_mouse_maxpkt = 0;
 	cached_kb_ep = 0;
@@ -290,19 +277,6 @@ void kmbox_init(void)
 	cached_mouse_report_len = 0;
 	return;
 #endif
-#if BT_ENABLED
-	// LPUART7: pin 29 (GPIO_AD_B1_02) = TX, pin 28 (GPIO_AD_B1_03) = RX
-	CCM_CCGR5 |= CCM_CCGR5_LPUART7(CCM_CCGR_ON);
-	IOMUXC_SW_MUX_CTL_PAD_GPIO_AD_B1_02 = 2;
-	IOMUXC_SW_PAD_CTL_PAD_GPIO_AD_B1_02 =
-		IOMUXC_PAD_DSE(6) | IOMUXC_PAD_SPEED(2);
-	IOMUXC_LPUART7_TX_SELECT_INPUT = 1;
-	IOMUXC_SW_MUX_CTL_PAD_GPIO_AD_B1_03 = 2;
-	IOMUXC_SW_PAD_CTL_PAD_GPIO_AD_B1_03 =
-		IOMUXC_PAD_DSE(6) | IOMUXC_PAD_SPEED(2) |
-		IOMUXC_PAD_PKE | IOMUXC_PAD_PUE | IOMUXC_PAD_PUS(3);
-	IOMUXC_LPUART7_RX_SELECT_INPUT = 1;
-#else
 	// LPUART6: pin 1 (GPIO_AD_B0_02) = TX, pin 0 (GPIO_AD_B0_03) = RX
 	CCM_CCGR3 |= CCM_CCGR3_LPUART6(CCM_CCGR_ON);
 	IOMUXC_SW_MUX_CTL_PAD_GPIO_AD_B0_02 = 2;
@@ -314,7 +288,20 @@ void kmbox_init(void)
 		IOMUXC_PAD_DSE(6) | IOMUXC_PAD_SPEED(2) |
 		IOMUXC_PAD_PKE | IOMUXC_PAD_PUE | IOMUXC_PAD_PUS(3);
 	IOMUXC_LPUART6_RX_SELECT_INPUT = 1;
-#endif
+
+	// Status LEDs on BT module footprint (D31=LINK, D30=STATE)
+	IOMUXC_SW_MUX_CTL_PAD_GPIO_EMC_37 = 5; // D31 LINK — ALT5 = GPIO3[23]
+	IOMUXC_SW_PAD_CTL_PAD_GPIO_EMC_37 = IOMUXC_PAD_DSE(6);
+	IOMUXC_SW_MUX_CTL_PAD_GPIO_EMC_36 = 5; // D30 STATE — ALT5 = GPIO3[22]
+	IOMUXC_SW_PAD_CTL_PAD_GPIO_EMC_36 = IOMUXC_PAD_DSE(6);
+	GPIO3_GDIR |= LINK_LED_BIT | STATE_LED_BIT;
+	GPIO3_DR_CLEAR = LINK_LED_BIT | STATE_LED_BIT;
+
+	// D24 STATUS LED — solid when UART OK, flickers on error
+	IOMUXC_SW_MUX_CTL_PAD_GPIO_AD_B0_12 = 5; // D24 — ALT5 = GPIO1[12]
+	IOMUXC_SW_PAD_CTL_PAD_GPIO_AD_B0_12 = IOMUXC_PAD_DSE(6);
+	GPIO1_GDIR |= STATUS_LED_BIT;
+	GPIO1_DR_SET = STATUS_LED_BIT; // ON = UART configured OK
 
 	// Baud: pick OSR so SBR >= 1 (e.g. 2M @ 24MHz -> OSR=11, SBR=1)
 	uint32_t osr;
@@ -329,7 +316,6 @@ void kmbox_init(void)
 	KM_UART_BAUD = LPUART_BAUD_OSR(osr) | LPUART_BAUD_SBR(sbr);
 
 	// Disable TE/RE before FIFO config (required by i.MX RT datasheet).
-	// uart_init() may have already enabled them when UART_ENABLED=1.
 	KM_UART_CTRL = 0;
 
 	// Enable 4-entry RX and TX hardware FIFOs (must be set while TE/RE clear)
@@ -384,6 +370,9 @@ void kmbox_init(void)
 	memset(&inject, 0, sizeof(inject));
 	frames_ok = 0;
 	frames_err = 0;
+	uart_overrun_count = 0;
+	uart_framing_count = 0;
+	uart_noise_count = 0;
 
 	cached_mouse_ep = 0;
 	cached_mouse_maxpkt = 0;
@@ -391,6 +380,8 @@ void kmbox_init(void)
 	memset(&mouse_layout, 0, sizeof(mouse_layout));
 	mouse_layout.wheel_bit = 0xFFFF;
 	cached_mouse_report_len = 0;
+
+	link_last_rx_time = 0;
 
 	ferrum_init();
 	makcu_init();
@@ -468,9 +459,11 @@ static void parse_mouse_layout(const uint8_t *rd, uint16_t rdlen)
 					} else if (u == 0x31) { // Y
 						mouse_layout.y_bit = bit_pos;
 						mouse_layout.y_size = report_size;
+						mouse_layout.y_report_id = current_rid;
 					} else if (u == 0x38) { // Wheel
 						mouse_layout.wheel_bit = bit_pos;
 						mouse_layout.wheel_size = report_size;
+						mouse_layout.wheel_report_id = current_rid;
 					}
 				}
 				bit_pos += report_size;
@@ -525,7 +518,7 @@ static int32_t read_report_field(const uint8_t *buf, uint16_t bit_off,
 	return (int32_t)raw;
 }
 
-static void write_report_field(uint8_t *buf, uint16_t bit_off,
+static void write_report_field(uint8_t *buf, uint16_t buf_len, uint16_t bit_off,
                                uint8_t bit_size, uint8_t data_off, int32_t value)
 {
 	uint16_t abs_bit = bit_off + (uint16_t)data_off * 8;
@@ -534,11 +527,13 @@ static void write_report_field(uint8_t *buf, uint16_t bit_off,
 
 	if (__builtin_expect(bit_idx == 0, 1)) {
 		if (bit_size == 16) {
+			if (byte_idx + 2 > buf_len) return;
 			buf[byte_idx]     = (uint8_t)(value & 0xFF);
 			buf[byte_idx + 1] = (uint8_t)((value >> 8) & 0xFF);
 			return;
 		}
 		if (bit_size == 8) {
+			if (byte_idx + 1 > buf_len) return;
 			buf[byte_idx] = (uint8_t)(int8_t)value;
 			return;
 		}
@@ -547,6 +542,7 @@ static void write_report_field(uint8_t *buf, uint16_t bit_off,
 	uint32_t mask = ((1u << bit_size) - 1) << bit_idx;
 	uint32_t val  = ((uint32_t)value & ((1u << bit_size) - 1)) << bit_idx;
 	uint8_t bytes_needed = (bit_idx + bit_size + 7) >> 3;
+	if (byte_idx + bytes_needed > buf_len) return;
 	for (uint8_t b = 0; b < bytes_needed; b++) {
 		uint8_t m = (mask >> (b * 8)) & 0xFF;
 		uint8_t v = (val  >> (b * 8)) & 0xFF;
@@ -585,9 +581,13 @@ void kmbox_poll(void)
 	tx_flush();
 	uint32_t stat = KM_UART_STAT;
 	if (__builtin_expect(stat & (LPUART_STAT_OR | LPUART_STAT_FE | LPUART_STAT_NF), 0)) {
+		if (stat & LPUART_STAT_OR) uart_overrun_count++;
+		if (stat & LPUART_STAT_FE) uart_framing_count++;
+		if (stat & LPUART_STAT_NF) uart_noise_count++;
 		KM_UART_STAT = stat & (LPUART_STAT_OR | LPUART_STAT_FE | LPUART_STAT_NF);
 		proto_mode = PROTO_IDLE;
 		ferrum_pos = 0;
+		GPIO1_DR_TOGGLE = STATUS_LED_BIT;
 	}
 
 	if (__builtin_expect(inject.click_release_at, 0) && millis() >= inject.click_release_at) {
@@ -597,7 +597,28 @@ void kmbox_poll(void)
 		inject.click_release_at = 0;
 	}
 
+	if (__builtin_expect(inject.kb_release_at, 0) && millis() >= inject.kb_release_at) {
+		for (int i = 0; i < 6; i++) {
+			if (inject.kb_keys[i] == inject.kb_release_key) {
+				inject.kb_keys[i] = 0;
+				break;
+			}
+		}
+		inject.kb_dirty = true;
+		inject.kb_release_key = 0;
+		inject.kb_release_at = 0;
+	}
+
 	uint16_t head = ((uint32_t)KM_RX_DADDR - (uint32_t)dma_rx_ring) & (DMA_RX_RING_SIZE - 1);
+	if (head != rx_tail) {
+		// Data arriving — toggle LINK LED for visible blink
+		GPIO3_DR_TOGGLE = LINK_LED_BIT;
+		link_last_rx_time = millis();
+	} else if (link_last_rx_time && (millis() - link_last_rx_time) > 50) {
+		// No data for 50ms — LINK LED off
+		GPIO3_DR_CLEAR = LINK_LED_BIT;
+		link_last_rx_time = 0;
+	}
 	while (rx_tail != head) {
 		uint8_t b = dma_rx_ring[rx_tail];
 		rx_tail = (rx_tail + 1) & (DMA_RX_RING_SIZE - 1);
@@ -659,6 +680,7 @@ void kmbox_poll(void)
 				if ((frame_checksum & 0xFF) == b) {
 					dispatch_kmbox_frame();
 					frames_ok++;
+					GPIO3_DR_TOGGLE = STATE_LED_BIT;
 				} else {
 					frames_err++;
 				}
@@ -685,6 +707,7 @@ void kmbox_poll(void)
 				} else if (mk_len == 0) {
 					dispatch_makcu_frame();
 					frames_ok++;
+					GPIO3_DR_TOGGLE = STATE_LED_BIT;
 					proto_mode = PROTO_IDLE;
 				} else {
 					mk_pos = 0;
@@ -696,6 +719,7 @@ void kmbox_poll(void)
 				if (mk_pos >= mk_len) {
 					dispatch_makcu_frame();
 					frames_ok++;
+					GPIO3_DR_TOGGLE = STATE_LED_BIT;
 					proto_mode = PROTO_IDLE;
 				}
 				break;
@@ -706,6 +730,7 @@ void kmbox_poll(void)
 				if (ferrum_pos > 0) {
 					ferrum_line[ferrum_pos] = '\0';
 					dispatch_ferrum_line();
+					GPIO3_DR_TOGGLE = STATE_LED_BIT;
 				}
 				ferrum_pos = 0;
 				proto_mode = PROTO_IDLE;
@@ -731,39 +756,45 @@ void kmbox_merge_report(uint8_t iface_protocol, uint8_t * restrict report, uint8
 		    (inject.mouse_dx || inject.mouse_dy ||
 		     inject.mouse_buttons || inject.mouse_wheel)) {
 			uint8_t doff = mouse_layout.data_off;
+			uint8_t rid = doff ? report[0] : 0;
 
-			report[doff] |= inject.mouse_buttons;
+			if (rid == mouse_layout.report_id) {
+				report[doff] |= inject.mouse_buttons;
 
-			int32_t rx = read_report_field(report, mouse_layout.x_bit,
-			                               mouse_layout.x_size, doff);
-			int32_t mx = rx + inject.mouse_dx;
-			if (mx > mouse_layout.x_max) mx = mouse_layout.x_max;
-			if (mx < -mouse_layout.x_max) mx = -mouse_layout.x_max;
-			write_report_field(report, mouse_layout.x_bit,
-			                   mouse_layout.x_size, doff, mx);
+				int32_t rx = read_report_field(report, mouse_layout.x_bit,
+				                               mouse_layout.x_size, doff);
+				int32_t mx = rx + inject.mouse_dx;
+				if (mx > mouse_layout.x_max) mx = mouse_layout.x_max;
+				if (mx < -mouse_layout.x_max) mx = -mouse_layout.x_max;
+				write_report_field(report, len, mouse_layout.x_bit,
+				                   mouse_layout.x_size, doff, mx);
 
-			int32_t ry = read_report_field(report, mouse_layout.y_bit,
-			                               mouse_layout.y_size, doff);
-			int32_t my = ry + inject.mouse_dy;
-			if (my > mouse_layout.y_max) my = mouse_layout.y_max;
-			if (my < -mouse_layout.y_max) my = -mouse_layout.y_max;
-			write_report_field(report, mouse_layout.y_bit,
-			                   mouse_layout.y_size, doff, my);
+				if (rid == mouse_layout.y_report_id) {
+					int32_t ry = read_report_field(report, mouse_layout.y_bit,
+					                               mouse_layout.y_size, doff);
+					int32_t my = ry + inject.mouse_dy;
+					if (my > mouse_layout.y_max) my = mouse_layout.y_max;
+					if (my < -mouse_layout.y_max) my = -mouse_layout.y_max;
+					write_report_field(report, len, mouse_layout.y_bit,
+					                   mouse_layout.y_size, doff, my);
+				}
+			}
 
-			if (mouse_layout.wheel_bit != 0xFFFF && inject.mouse_wheel != 0) {
+			if (mouse_layout.wheel_bit != 0xFFFF && inject.mouse_wheel != 0 &&
+			    rid == mouse_layout.wheel_report_id) {
 				int32_t rw = read_report_field(report, mouse_layout.wheel_bit,
 				                               mouse_layout.wheel_size, doff);
 				int32_t mw = rw + inject.mouse_wheel;
 				if (mw > mouse_layout.w_max) mw = mouse_layout.w_max;
 				if (mw < -mouse_layout.w_max) mw = -mouse_layout.w_max;
-				write_report_field(report, mouse_layout.wheel_bit,
+				write_report_field(report, len, mouse_layout.wheel_bit,
 				                   mouse_layout.wheel_size, doff, mw);
 			}
 
 			inject.mouse_dx = 0;
 			inject.mouse_dy = 0;
 			inject.mouse_wheel = 0;
-			inject.mouse_dirty = false;
+			inject.mouse_dirty = (inject.mouse_buttons != 0);
 		}
 		merged_this_cycle = true;
 	} else if (iface_protocol == 1 && inject.kb_dirty) {
@@ -808,16 +839,17 @@ void kmbox_send_pending(void)
 		if (dy > mouse_layout.y_max) dy = mouse_layout.y_max;
 		if (dy < -mouse_layout.y_max) dy = -mouse_layout.y_max;
 
-		write_report_field(synth, mouse_layout.x_bit,
+		write_report_field(synth, sizeof(synth), mouse_layout.x_bit,
 		                   mouse_layout.x_size, doff, dx);
-		write_report_field(synth, mouse_layout.y_bit,
+		write_report_field(synth, sizeof(synth), mouse_layout.y_bit,
 		                   mouse_layout.y_size, doff, dy);
 
-		if (mouse_layout.wheel_bit != 0xFFFF && inject.mouse_wheel != 0) {
+		if (mouse_layout.wheel_bit != 0xFFFF && inject.mouse_wheel != 0 &&
+		    mouse_layout.wheel_report_id == mouse_layout.report_id) {
 			int32_t w = inject.mouse_wheel;
 			if (w > mouse_layout.w_max) w = mouse_layout.w_max;
 			if (w < -mouse_layout.w_max) w = -mouse_layout.w_max;
-			write_report_field(synth, mouse_layout.wheel_bit,
+			write_report_field(synth, sizeof(synth), mouse_layout.wheel_bit,
 			                   mouse_layout.wheel_size, doff, w);
 		}
 		uint8_t rlen = cached_mouse_report_len;
@@ -826,7 +858,7 @@ void kmbox_send_pending(void)
 		inject.mouse_dx = 0;
 		inject.mouse_dy = 0;
 		inject.mouse_wheel = 0;
-		inject.mouse_dirty = false;
+		inject.mouse_dirty = (inject.mouse_buttons != 0);
 	}
 	if (inject.kb_dirty && cached_kb_ep) {
 		uint8_t synth[8];
@@ -834,6 +866,9 @@ void kmbox_send_pending(void)
 		synth[1] = 0;
 		memcpy(&synth[2], inject.kb_keys, 6);
 		usb_device_send_report(cached_kb_ep, synth, 8);
+		static const uint8_t zeros[6] = {0};
+		inject.kb_dirty = (inject.kb_modifier != 0 ||
+		                    memcmp(inject.kb_keys, zeros, 6) != 0);
 	}
 }
 
@@ -847,6 +882,9 @@ void kmbox_inject_smooth(int16_t dx, int16_t dy)
 uint32_t kmbox_frame_count(void) { return frames_ok; }
 uint32_t kmbox_error_count(void) { return frames_err; }
 uint32_t kmbox_rx_byte_count(void) { return rx_bytes_total; }
+uint32_t kmbox_uart_overrun(void) { return uart_overrun_count; }
+uint32_t kmbox_uart_framing(void) { return uart_framing_count; }
+uint32_t kmbox_uart_noise(void) { return uart_noise_count; }
 static void apply_mouse_result(int16_t dx, int16_t dy, uint8_t buttons,
                                int8_t wheel, bool use_smooth)
 {
@@ -978,6 +1016,10 @@ static void dispatch_makcu_frame(void)
 		if (result.click_release) {
 			inject.click_release_mask = result.mouse_buttons;
 			inject.click_release_at = millis() + 30;
+		}
+		if (result.kb_click_release) {
+			inject.kb_release_key = result.kb_release_key;
+			inject.kb_release_at = millis() + 30;
 		}
 		if (result.needs_response) {
 			makcu_send_response(result.resp_cmd, result.resp_payload,
